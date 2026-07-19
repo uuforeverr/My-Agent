@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "updated_at": "2026-07-17T18:05:18",
+  "tasks": {
+    "89635bc8": {
+      "id": "89635bc8",
+      "name": "每日锅包肉提醒",
+      "enabled": true,
+      "created_at": "2026-07-13T19:55:03",
+      "updated_at": "2026-07-17T12:00:13",
+      "schedule": {
+        "type": "cron",
+        "expression": "0 12 * * *"
+      },
+      "action": {
+        "type": "send_message",
+        "content": "🥢 中午了boss！别光顾着忙，该去吃锅包肉了。金黄酥脆、酸甜可口的那一口，等着你呢。",
+        "target": {
+          "channel_type": "cli",
+          "user_id": "local",
+          "is_group": false,
+          "group_id": null,
+          "session_id": "cli:local"
+        }
+      },
+      "next_run_at": "2026-07-18T12:00:00",
+      "last_run_at": "2026-07-17T12:00:13",
+      "last_error": null,
+      "last_error_at": null
+    },
+    "81acf700": {
+      "id": "81acf700",
+      "name": "每隔45分钟站立活动提醒",
+      "enabled": true,
+      "created_at": "2026-07-13T19:56:44",
+      "updated_at": "2026-07-17T18:05:18",
+      "schedule": {
+        "type": "interval",
+        "seconds": 2700
+      },
+      "action": {
+        "type": "send_message",
+        "content": "🧘 Boss，45分钟过去了！站起来扭扭腰、走两步、喝口水。久坐伤身，动一动再继续。",
+        "target": {
+          "channel_type": "cli",
+          "user_id": "local",
+          "is_group": false,
+          "group_id": null,
+          "session_id": "cli:local"
+        }
+      },
+      "next_run_at": "2026-07-17T18:50:18.167937",
+      "last_run_at": "2026-07-17T18:05:18",
+      "last_error": null,
+      "last_error_at": null
+    },
+    "system_daily_dream": {
+      "id": "system_daily_dream",
+      "name": "每日凌晨做梦",
+      "enabled": true,
+      "created_at": "2026-07-13T20:13:23",
+      "updated_at": "2026-07-17T00:00:10",
+      "schedule": {
+        "type": "cron",
+        "expression": "0 0 * * *"
+      },
+      "action": {
+        "type": "memory_dream",
+        "lookback_days": 1
+      },
+      "next_run_at": "2026-07-18T00:00:00",
+      "last_run_at": "2026-07-17T00:00:10",
+      "last_error": null,
+      "last_error_at": null
+    }
+  }
+}

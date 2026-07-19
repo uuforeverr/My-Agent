@@ -1,0 +1,11 @@
+[run]
+source = .
+omit =
+    tests/*
+    */tests/*
+    .venv/*
+    htmlcov/*
+
+[report]
+show_missing = True
+skip_empty = True

@@ -1,0 +1,2 @@
+{"created_at": "2026-07-07T11:24:11", "session_id": "cli:local", "role": "user", "content": "你好", "name": null, "metadata": {"entrypoint": "cli"}}
+{"created_at": "2026-07-07T11:24:14", "session_id": "cli:local", "role": "assistant", "content": "你好！我是 my-agent，你的编程和文件工作助手。我可以帮你检查、理解、编辑和验证工作区里的文件。有什么需要帮忙的吗？", "name": null, "metadata": {"tool_calls": []}}
