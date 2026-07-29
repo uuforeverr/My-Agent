@@ -1,0 +1,8 @@
+# Runtime dependencies.
+#
+# The core CLI uses only the Python standard library, but the documented
+# runtime feature set needs these optional integrations:
+# - lark-oapi: Feishu WebSocket channel
+# - croniter: cron-based scheduler tasks and daily dream scheduling
+lark-oapi>=1.6,<2.0
+croniter>=6.0,<7.0

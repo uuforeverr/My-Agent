@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Test runner used by the repository's pytest suite.
+pytest>=8.0,<9.0
