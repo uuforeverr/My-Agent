@@ -2,8 +2,11 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any, Optional
 
+from agent.compactor import Compactor, build_summary_message, split_recent_turns
 from agent.run_context import RunContext
+from agent.token_counter import TokenCounter
 from memory import MemoryManager
+from memory.raw_store import RawConversationStore
 from skills import SkillLoader
 
 
@@ -16,6 +19,9 @@ class ContextManager:
         skill_loader: Optional[SkillLoader] = None,
         memory_search_results: int = 5,
         memory_flush_messages: int = 12,
+        keep_recent_turns: int = 3,
+        token_counter: Optional[TokenCounter] = None,
+        compactor: Optional[Compactor] = None,
     ):
         self.system_prompt = system_prompt
         self.max_history_messages = max_history_messages
@@ -23,7 +29,12 @@ class ContextManager:
         self.skill_loader = skill_loader
         self.memory_search_results = memory_search_results
         self.memory_flush_messages = memory_flush_messages
+        self.keep_recent_turns = max(1, int(keep_recent_turns))
+        self.token_counter = token_counter or TokenCounter()
+        self.compactor = compactor
         self.history: list[dict[str, Any]] = []
+        self.compact_count = 0
+        self.last_compact_reason = ""
 
     def append_user_message(self, content: str) -> None:
         self.history.append({"role": "user", "content": content})
@@ -39,32 +50,187 @@ class ContextManager:
             "content": content,
         })
 
-    def build_model_messages(self, run_context: RunContext) -> list[dict[str, Any]]:
+    def build_model_messages(
+        self,
+        run_context: RunContext,
+        tool_schemas: Optional[list[dict[str, Any]]] = None,
+    ) -> list[dict[str, Any]]:
         with run_context.trace.start_span(
             "context.build",
             span_kind="context.build",
             session_id=run_context.session_id,
             history_before=len(self.history),
         ) as span:
-            history = self._trim_history(run_context)
-            query = self._latest_user_message(history)
-            system_prompt, prompt_metadata = self._build_system_prompt(query, run_context)
-            messages = [{"role": "system", "content": system_prompt}]
-            messages.extend(deepcopy(history))
+            messages, prompt_metadata = self._assemble(run_context)
+            if self._should_compact(messages, tool_schemas):
+                self.compact_history(
+                    run_context,
+                    tool_schemas=tool_schemas,
+                    assembled_messages=messages,
+                )
+                messages, prompt_metadata = self._assemble(run_context)
             span.set_attributes(
                 message_count=len(messages),
-                history_count=len(history),
-                system_prompt_chars=len(system_prompt),
+                history_count=len(self.history),
+                system_prompt_chars=len(messages[0]["content"] if messages else ""),
                 **prompt_metadata,
             )
             run_context.trace.add(
                 "context_built",
                 session_id=run_context.session_id,
                 message_count=len(messages),
-                history_count=len(history),
+                history_count=len(self.history),
                 **prompt_metadata,
             )
             return messages
+
+    def compact_now(
+        self,
+        run_context: RunContext,
+        tool_schemas: Optional[list[dict[str, Any]]] = None,
+    ) -> bool:
+        to_compact, _recent = split_recent_turns(self.history, self.keep_recent_turns)
+        if not to_compact:
+            return False
+        messages, _metadata = self._assemble(run_context)
+        return self.compact_history(
+            run_context,
+            tool_schemas=tool_schemas,
+            assembled_messages=messages,
+            reason="manual",
+        )
+
+    def compact_history(
+        self,
+        run_context: RunContext,
+        tool_schemas: Optional[list[dict[str, Any]]] = None,
+        assembled_messages: Optional[list[dict[str, Any]]] = None,
+        reason: str = "",
+    ) -> bool:
+        history_before = len(self.history)
+        tokens_before = self.token_counter.count_payload(assembled_messages, tool_schemas)
+        count_over = history_before > self.max_history_messages
+        tokens_over = tokens_before > self.token_counter.max_input_tokens
+        if not reason:
+            reason = "count" if count_over else "tokens"
+
+        to_compact, recent = split_recent_turns(self.history, self.keep_recent_turns)
+        with run_context.trace.start_span(
+            "context.compact",
+            span_kind="context.compact",
+            session_id=run_context.session_id,
+            reason=reason,
+            history_before=history_before,
+            tokens_before=tokens_before,
+            compact_count=self.compact_count,
+        ) as span:
+            if not to_compact:
+                span.set_attributes(
+                    previewed=False,
+                    history_after=len(self.history),
+                    compact_count=self.compact_count,
+                )
+                return False
+
+            try:
+                if self.compactor is None:
+                    raise RuntimeError("compaction llm is not configured")
+                next_count = self.compact_count + 1
+                raw_path = self._raw_transcript_pointer(run_context.session_id)
+                summary = self.compactor.summarize(
+                    to_compact,
+                    compact_count=next_count,
+                    raw_path=raw_path,
+                )
+            except Exception as error:
+                span.record_error(error)
+                span.set_attribute("error_type", type(error).__name__)
+                return False
+
+            self.compact_count = next_count
+            self.last_compact_reason = reason
+            self.history = [build_summary_message(summary, next_count, raw_path)] + recent
+            self._flush_discarded(to_compact, run_context, reason="context_compact")
+            span.set_attributes(
+                history_after=len(self.history),
+                tokens_after=self.token_counter.count_payload(
+                    [{"role": "system", "content": ""}] + self.history,
+                    tool_schemas,
+                ),
+                compact_count=self.compact_count,
+                discarded_count=len(to_compact),
+            )
+            return True
+
+    def _should_compact(
+        self,
+        messages: list[dict[str, Any]],
+        tool_schemas: Optional[list[dict[str, Any]]],
+    ) -> bool:
+        if len(self.history) > self.max_history_messages:
+            return True
+        return self.token_counter.count_payload(messages, tool_schemas) > self.token_counter.max_input_tokens
+
+    def _assemble(self, run_context: RunContext) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        history = list(self.history)
+        query = self._latest_user_message(history)
+        system_prompt, prompt_metadata = self._build_system_prompt(query, run_context)
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(deepcopy(history))
+        return messages, prompt_metadata
+
+    def _flush_discarded(
+        self,
+        discarded: list[dict[str, Any]],
+        run_context: RunContext,
+        reason: str,
+    ) -> None:
+        if not discarded:
+            return
+        run_context.trace.add(
+            "context_trimmed",
+            session_id=run_context.session_id,
+            discarded_count=len(discarded),
+            remaining_count=len(self.history),
+            reason=reason,
+        )
+        if not self.memory:
+            return
+        with run_context.trace.start_span(
+            "memory.flush",
+            span_kind="memory.flush",
+            session_id=run_context.session_id,
+            reason=reason,
+            discarded_count=len(discarded),
+            max_messages=self.memory_flush_messages,
+        ) as span:
+            flush_stats = self.memory.flush_from_messages(
+                discarded,
+                reason=reason,
+                session_id=run_context.session_id,
+                max_messages=self.memory_flush_messages,
+            )
+            span.set_attributes(
+                async_dispatched=bool(flush_stats.get("async")),
+                skipped=bool(flush_stats.get("skipped")),
+                ok=bool(flush_stats.get("ok")),
+            )
+        future = flush_stats.get("future")
+        if hasattr(future, "add_done_callback"):
+            future.add_done_callback(
+                lambda done: self._record_memory_flush_result(run_context, done)
+            )
+        trace_stats = {k: v for k, v in flush_stats.items() if k != "future"}
+        run_context.trace.add(
+            "memory_flush_dispatched",
+            session_id=run_context.session_id,
+            **trace_stats,
+        )
+
+    def _raw_transcript_pointer(self, session_id: str) -> str:
+        safe_session = RawConversationStore._safe_session_id(session_id)
+        day = datetime.now().strftime("%Y-%m-%d")
+        return f"data/memory/raw/{safe_session}/{day}.jsonl"
 
     def _build_system_prompt(
         self,
@@ -148,61 +314,6 @@ class ContextManager:
                 lines.append(f"{key}: {value}")
         lines.append("</runtime_context>")
         return "\n".join(lines)
-
-    def _trim_history(self, run_context: RunContext) -> list[dict[str, Any]]:
-        if len(self.history) <= self.max_history_messages:
-            return list(self.history)
-
-        discard_count = len(self.history) - self.max_history_messages
-        discarded = list(self.history[:discard_count])
-        trimmed = list(self.history[discard_count:])
-
-        # A leading tool message is invalid without the assistant tool_call that
-        # requested it. Drop leading tool messages after simple count-based trim.
-        while trimmed and trimmed[0].get("role") == "tool":
-            discarded.append(trimmed.pop(0))
-
-        self.history = trimmed
-        run_context.trace.add(
-            "context_trimmed",
-            session_id=run_context.session_id,
-            discarded_count=len(discarded),
-            remaining_count=len(trimmed),
-        )
-
-        if self.memory and discarded:
-            with run_context.trace.start_span(
-                "memory.flush",
-                span_kind="memory.flush",
-                session_id=run_context.session_id,
-                reason="context_trim",
-                discarded_count=len(discarded),
-                max_messages=self.memory_flush_messages,
-            ) as span:
-                flush_stats = self.memory.flush_from_messages(
-                    discarded,
-                    reason="context_trim",
-                    session_id=run_context.session_id,
-                    max_messages=self.memory_flush_messages,
-                )
-                span.set_attributes(
-                    async_dispatched=bool(flush_stats.get("async")),
-                    skipped=bool(flush_stats.get("skipped")),
-                    ok=bool(flush_stats.get("ok")),
-                )
-            future = flush_stats.get("future")
-            if hasattr(future, "add_done_callback"):
-                future.add_done_callback(
-                    lambda done: self._record_memory_flush_result(run_context, done)
-                )
-            trace_stats = {k: v for k, v in flush_stats.items() if k != "future"}
-            run_context.trace.add(
-                "memory_flush_dispatched",
-                session_id=run_context.session_id,
-                **trace_stats,
-            )
-
-        return trimmed
 
     @staticmethod
     def _record_memory_flush_result(run_context: RunContext, future: Any) -> None:

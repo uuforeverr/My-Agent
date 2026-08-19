@@ -10,6 +10,8 @@ if TYPE_CHECKING:
 class ToolResult:
     ok: bool
     content: str
+    waiting_approval: bool = False
+    approval_id: str = ""
 
 
 class ToolError(RuntimeError):
@@ -20,9 +22,15 @@ class BaseTool:
     name = "base"
     description = "Base tool"
     parameters: dict[str, Any] = {"type": "object", "properties": {}}
+    risk_level = "L0"
+    requires_approval: Optional[bool] = None
+    idempotent = True
 
     def __init__(self, workspace: Path):
         self.workspace = workspace.resolve()
+
+    def risk_for(self, arguments: dict[str, Any]) -> str:
+        return self.risk_level
 
     def schema(self) -> dict[str, Any]:
         return {

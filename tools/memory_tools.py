@@ -18,6 +18,8 @@ class RememberMemoryTool(BaseTool):
         },
         "required": ["content"],
     }
+    risk_level = "L1"
+    idempotent = False
 
     def __init__(self, workspace: Path, memory: MemoryManager):
         super().__init__(workspace)
@@ -44,6 +46,8 @@ class SearchMemoryTool(BaseTool):
         },
         "required": ["query"],
     }
+    risk_level = "L0"
+    idempotent = True
 
     def __init__(self, workspace: Path, memory: MemoryManager):
         super().__init__(workspace)
@@ -72,6 +76,8 @@ class ReadMemoryTool(BaseTool):
         "type": "object",
         "properties": {},
     }
+    risk_level = "L0"
+    idempotent = True
 
     def __init__(self, workspace: Path, memory: MemoryManager):
         super().__init__(workspace)

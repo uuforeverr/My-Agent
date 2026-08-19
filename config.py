@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 
 def _load_dotenv(path: Path) -> None:
@@ -41,6 +42,9 @@ class Settings:
     daily_dream_enabled: bool = True
     daily_dream_cron: str = "0 0 * * *"
     daily_dream_lookback_days: int = 1
+    tool_approval_mode: str = "off"
+    model_context_window: Optional[int] = None
+    keep_recent_turns: int = 3
 
 
 def _parse_channels(raw: str) -> tuple[str, ...]:
@@ -50,6 +54,21 @@ def _parse_channels(raw: str) -> tuple[str, ...]:
 
 def _parse_bool(raw: str) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_approval_mode(raw: str) -> str:
+    return "on" if str(raw).strip().lower() == "on" else "off"
+
+
+def _parse_optional_positive_int(raw: str) -> Optional[int]:
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def load_settings() -> Settings:
@@ -87,4 +106,7 @@ def load_settings() -> Settings:
         daily_dream_enabled=_parse_bool(os.environ.get("DAILY_DREAM_ENABLED", "true")),
         daily_dream_cron=os.environ.get("DAILY_DREAM_CRON", "0 0 * * *").strip(),
         daily_dream_lookback_days=int(os.environ.get("DAILY_DREAM_LOOKBACK_DAYS", "1")),
+        tool_approval_mode=_parse_approval_mode(os.environ.get("TOOL_APPROVAL_MODE", "off")),
+        model_context_window=_parse_optional_positive_int(os.environ.get("MODEL_CONTEXT_WINDOW", "")),
+        keep_recent_turns=max(1, int(os.environ.get("KEEP_RECENT_TURNS", "3"))),
     )

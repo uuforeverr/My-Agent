@@ -114,6 +114,39 @@ def test_dispatch_dream_skipped(settings_factory, tmp_path, capsys):
     assert "skipped" in capsys.readouterr().out
 
 
+class SummarizeAgent:
+    def __init__(self, result="已压缩"):
+        self.result = result
+        self.calls = []
+        self.run_called = False
+
+    def summarize_session(self, session_id):
+        self.calls.append(session_id)
+        return self.result
+
+    def run(self, *args, **kwargs):
+        self.run_called = True
+        raise AssertionError("summarize must not enter Agent.run")
+
+
+def test_dispatch_summarize_does_not_produce(settings_factory, tmp_path, capsys):
+    agent = SummarizeAgent("已压缩")
+    channel = _channel(settings_factory, tmp_path, agent=agent)
+
+    assert channel._dispatch("/summarize") == CONTINUE
+    assert agent.calls == ["cli:local"]
+    assert agent.run_called is False
+    assert channel.sessions == {}
+    assert "已压缩" in capsys.readouterr().out
+
+
+def test_dispatch_summarize_noop_message(settings_factory, tmp_path, capsys):
+    agent = SummarizeAgent("无需压缩")
+    channel = _channel(settings_factory, tmp_path, agent=agent)
+    channel._dispatch("/summarize")
+    assert "无需压缩" in capsys.readouterr().out
+
+
 def test_dispatch_normal_input_produces(settings_factory, tmp_path):
     channel = _channel(settings_factory, tmp_path)
     assert channel._dispatch("hello there") == PRODUCED
@@ -122,6 +155,64 @@ def test_dispatch_normal_input_produces(settings_factory, tmp_path):
     assert isinstance(queued, IncomingMessage)
     assert queued.content == "hello there"
     assert queued.channel_type == "cli"
+
+
+class ApprovalAgent:
+    def __init__(self, result="已批准 [abcdef12]"):
+        self.result = result
+        self.calls = []
+        self.run_called = False
+
+    def approve_tool(self, approval_id, user_id, scope="once"):
+        self.calls.append(("approve", approval_id, user_id, scope))
+        return self.result
+
+    def deny_tool(self, approval_id, user_id):
+        self.calls.append(("deny", approval_id, user_id))
+        return f"已拒绝 [{approval_id}]"
+
+    def run(self, *args, **kwargs):
+        self.run_called = True
+        raise AssertionError("approval slash must not enter Agent.run")
+
+
+def test_dispatch_approve_does_not_produce(settings_factory, tmp_path, capsys):
+    agent = ApprovalAgent()
+    channel = _channel(settings_factory, tmp_path, agent=agent)
+
+    assert channel._dispatch("/approve abcdef12") == CONTINUE
+    assert agent.calls == [("approve", "abcdef12", "local", "once")]
+    assert agent.run_called is False
+    assert channel.sessions == {}
+    assert "已批准 [abcdef12]" in capsys.readouterr().out
+
+
+def test_dispatch_approve_session_and_deny(settings_factory, tmp_path, capsys):
+    agent = ApprovalAgent()
+    channel = _channel(settings_factory, tmp_path, agent=agent)
+
+    assert channel._dispatch("/approve abcdef12 session") == CONTINUE
+    assert channel._dispatch("/deny abcdef12") == CONTINUE
+    assert agent.calls == [
+        ("approve", "abcdef12", "local", "session"),
+        ("deny", "abcdef12", "local"),
+    ]
+    assert agent.run_called is False
+    assert channel.sessions == {}
+    out = capsys.readouterr().out
+    assert "已批准" in out
+    assert "已拒绝" in out
+
+
+def test_dispatch_approve_without_id_prints_usage(settings_factory, tmp_path, capsys):
+    agent = ApprovalAgent()
+    channel = _channel(settings_factory, tmp_path, agent=agent)
+
+    assert channel._dispatch("/approve") == CONTINUE
+    assert agent.calls == []
+    assert agent.run_called is False
+    assert channel.sessions == {}
+    assert "用法" in capsys.readouterr().out
 
 
 def test_send_prints_reply(settings_factory, tmp_path, capsys):

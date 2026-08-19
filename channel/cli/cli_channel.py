@@ -5,6 +5,7 @@ from channel.chat_channel import ChatChannel
 from channel.message import IncomingMessage
 from channel.reply import Reply
 from observability import TraceQuery, format_trace_tree, summarize_trace_record
+from tools.approval import handle_approval_command
 
 STOP = "stop"
 CONTINUE = "continue"
@@ -54,6 +55,17 @@ class CLIChannel(ChatChannel):
                 print(f"dream done. diary: {result.get('dream_path') or '(no diary)'}")
             else:
                 print(f"dream skipped: {result.get('reason', 'unknown')}")
+            return CONTINUE
+        if line == "/summarize":
+            summarize = getattr(self.agent, "summarize_session", None)
+            if callable(summarize):
+                print(summarize("cli:local"))
+            else:
+                print("无需压缩")
+            return CONTINUE
+        handled = handle_approval_command(self.agent, line, self.user_id)
+        if handled is not None:
+            print(handled)
             return CONTINUE
         if line == "/sop" or line.startswith("/sop "):
             days = self._parse_sop_days(line)

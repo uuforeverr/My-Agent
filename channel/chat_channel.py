@@ -102,7 +102,8 @@ class ChatChannel(Channel):
         )
 
         def _on_event(event: dict) -> None:
-            if event.get("type") != "assistant_progress":
+            event_type = event.get("type")
+            if event_type not in {"assistant_progress", "approval_request"}:
                 return
             content = str(event.get("content") or "").strip()
             if content:
@@ -112,7 +113,7 @@ class ChatChannel(Channel):
                     session_id=message.session_id,
                     channel_type=message.channel_type,
                     reply_chars=len(content),
-                    reply_type="assistant_progress",
+                    reply_type=event_type,
                 ):
                     self.send(Reply(content), message)
 

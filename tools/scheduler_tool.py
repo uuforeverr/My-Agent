@@ -67,10 +67,18 @@ class SchedulerTool(BaseTool):
         },
         "required": ["action"],
     }
+    risk_level = "L2"
+    idempotent = False
 
     def __init__(self, workspace: Path, store: TaskStore):
         super().__init__(workspace)
         self.store = store
+
+    def risk_for(self, arguments: dict[str, Any]) -> str:
+        action = str((arguments or {}).get("action", "")).strip()
+        if action in ("list", "get"):
+            return "L0"
+        return "L2"
 
     def run(
         self,

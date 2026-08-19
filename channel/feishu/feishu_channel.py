@@ -8,6 +8,7 @@ from channel.chat_channel import ChatChannel
 from channel.message import IncomingMessage
 from channel.reply import Reply
 from config import Settings
+from tools.approval import handle_approval_command
 
 TENANT_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal/"
 SEND_MESSAGE_URL = "https://open.feishu.cn/open-apis/im/v1/messages"
@@ -118,7 +119,7 @@ class FeishuChannel(ChatChannel):
         if not open_id:
             return
 
-        self.produce(IncomingMessage(
+        incoming = IncomingMessage(
             channel_type=self.channel_type,
             user_id=open_id,
             content=content,
@@ -126,7 +127,19 @@ class FeishuChannel(ChatChannel):
             is_group=is_group,
             group_id=message.get("chat_id") if is_group else None,
             raw=event,
-        ))
+        )
+        if content.strip() == "/summarize":
+            summarize = getattr(self.agent, "summarize_session", None)
+            reply_text = summarize(incoming.session_id) if callable(summarize) else "无需压缩"
+            self.send(Reply(reply_text), incoming)
+            return
+
+        handled = handle_approval_command(self.agent, content, open_id)
+        if handled is not None:
+            self.send(Reply(handled), incoming)
+            return
+
+        self.produce(incoming)
 
     def _fetch_bot_open_id(self) -> None:
         access_token = self.fetch_access_token()

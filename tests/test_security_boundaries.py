@@ -49,3 +49,21 @@ def test_bash_blocks_launchctl_word_boundary(tmp_workspace: Path):
     result = BashTool(tmp_workspace).run({"command": "launchctl list"})
     assert result.ok is False
     assert "privileged" in result.content.lower()
+
+
+def test_bash_rejects_echo(tmp_workspace: Path):
+    result = BashTool(tmp_workspace).run({"command": "echo hello"})
+    assert result.ok is False
+    assert "not allowed" in result.content.lower()
+
+
+def test_bash_rejects_pipe_chain(tmp_workspace: Path):
+    result = BashTool(tmp_workspace).run({"command": "pytest | cat"})
+    assert result.ok is False
+    assert "pipes" in result.content.lower() or "chaining" in result.content.lower()
+
+
+def test_bash_rejects_non_allowlisted_curl(tmp_workspace: Path):
+    result = BashTool(tmp_workspace).run({"command": "curl http://example.com"})
+    assert result.ok is False
+    assert "not allowed" in result.content.lower()

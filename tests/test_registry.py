@@ -91,7 +91,7 @@ def test_registry_records_skill_activate_when_reading_skill_file(tmp_workspace, 
         assert activate_span.span_kind == "skill.activate"
         assert activate_span.parent_span_id == tool_span.span_id
         assert activate_span.attributes["skill_name"] == "code-review"
-        assert activate_span.attributes["file_path"] == "skills/code-review/SKILL.md"
+        assert Path(activate_span.attributes["file_path"]).as_posix() == "skills/code-review/SKILL.md"
         assert activate_span.attributes["activation_source"] == "read_file"
         assert activate_span.attributes["ok"] is True
         assert activate_span.status == "success"

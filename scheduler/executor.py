@@ -4,6 +4,8 @@ from channel.reply import Reply
 from channel.target import ChannelTarget
 from observability import JsonlTraceStore, Trace
 
+WAITING_APPROVAL = "waiting_approval"
+
 # Injected collaborators (wired up by ChannelManager):
 #   send_reply(target, reply) -> bool         deliver text to a ChannelTarget
 #   run_agent(message, context) -> (answer, trace)   the Agent.run signature
@@ -41,7 +43,7 @@ class SchedulerExecutor:
         self.build_context = build_context
         self.trace_store = trace_store
 
-    def execute(self, task: dict[str, Any]) -> bool:
+    def execute(self, task: dict[str, Any]):
         action = task.get("action") or {}
         action_type = action.get("type")
         trace = Trace()
@@ -74,16 +76,20 @@ class SchedulerExecutor:
                     else:
                         raise ValueError(f"unknown action type: {action_type!r}")
 
-                span.set_attribute("delivered", bool(result))
-                if not result:
+                parked = result == WAITING_APPROVAL
+                delivered = result is not False
+                span.set_attribute("delivered", delivered)
+                span.set_attribute("parked", parked)
+                if result is False:
                     span.set_status("retry")
                 trace.add(
                     "scheduler_execute_completed",
                     task_id=task.get("id"),
                     action_type=action_type,
-                    delivered=bool(result),
+                    delivered=delivered,
+                    parked=parked,
                 )
-                trace.finish("success" if result else "retry")
+                trace.finish("success" if delivered else "retry")
                 return result
         except Exception as e:
             trace.record_error(
@@ -137,6 +143,14 @@ class SchedulerExecutor:
 
         context = self._scheduler_context(task, target, trace=trace)
         answer, _trace = self.run_agent(ai_task, context=context)
+        waiting = context.get("waiting_approval") if context is not None else None
+        if waiting:
+            task["pending_approval_id"] = waiting.get("approval_id") or ""
+            task["parked_session_id"] = context.session_id
+            prompt = (waiting.get("prompt") or answer or "").strip()
+            if prompt:
+                self._deliver(target, prompt)
+            return WAITING_APPROVAL
         answer = (answer or "").strip()
         trace.add(
             "scheduler_agent_task_completed",
@@ -160,8 +174,15 @@ class SchedulerExecutor:
         if not tool_name:
             raise ValueError("tool_call action has empty tool_name")
 
-        context = self._scheduler_context(task, target, trace=trace)
+        context = self._scheduler_context(task, target, trace=trace, resume_kind="tool_call")
         result = self.run_tool(tool_name, action.get("tool_arguments") or {}, context)
+        if getattr(result, "waiting_approval", False):
+            task["pending_approval_id"] = getattr(result, "approval_id", "") or ""
+            task["parked_session_id"] = context.session_id
+            content = getattr(result, "content", "") or ""
+            if content.strip():
+                self._deliver(target, content)
+            return WAITING_APPROVAL
         content = getattr(result, "content", str(result))
         trace.add(
             "scheduler_tool_call_completed",
@@ -174,7 +195,7 @@ class SchedulerExecutor:
             return True
         return self._deliver(target, content)
 
-    def _scheduler_context(self, task: dict[str, Any], target: ChannelTarget, trace: Trace):
+    def _scheduler_context(self, task: dict[str, Any], target: ChannelTarget, trace: Trace, **extra):
         session_id = f"scheduler:{target.session_id or target.user_id}:{task.get('id')}"
         return self.build_context(
             session_id=session_id,
@@ -185,6 +206,8 @@ class SchedulerExecutor:
             is_group=target.is_group,
             group_id=target.group_id,
             is_scheduled_task=True,
+            task_id=str(task.get("id") or ""),
+            **extra,
         )
 
     def _deliver(self, target: ChannelTarget, content: str) -> bool:

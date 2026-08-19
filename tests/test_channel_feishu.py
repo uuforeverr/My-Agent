@@ -63,6 +63,106 @@ def test_handle_p2p_text_event_produces_message(settings_factory, tmp_path):
     assert msg.session_id == "feishu:ou_abc"
 
 
+def test_summarize_does_not_produce_or_run_agent(settings_factory, tmp_path):
+    channel = _channel(settings_factory, tmp_path)
+    sent = []
+
+    class SummarizeAgent:
+        def summarize_session(self, session_id):
+            self.session_id = session_id
+            return "已压缩"
+
+        def run(self, *args, **kwargs):
+            raise AssertionError("summarize must not enter Agent.run")
+
+    channel.agent = SummarizeAgent()
+    channel.send = lambda reply, message: sent.append((reply.content, message.session_id))
+    channel._handle_message_event(_text_event(text="/summarize", open_id="ou_abc"))
+
+    assert channel.sessions == {}
+    assert sent == [("已压缩", "feishu:ou_abc")]
+
+
+def test_approve_does_not_produce_or_run_agent(settings_factory, tmp_path):
+    channel = _channel(settings_factory, tmp_path)
+    sent = []
+
+    class ApprovalAgent:
+        def __init__(self):
+            self.calls = []
+
+        def approve_tool(self, approval_id, user_id, scope="once"):
+            self.calls.append(("approve", approval_id, user_id, scope))
+            return f"已批准 [{approval_id}]"
+
+        def deny_tool(self, approval_id, user_id):
+            self.calls.append(("deny", approval_id, user_id))
+            return f"已拒绝 [{approval_id}]"
+
+        def run(self, *args, **kwargs):
+            raise AssertionError("approval slash must not enter Agent.run")
+
+    agent = ApprovalAgent()
+    channel.agent = agent
+    channel.send = lambda reply, message: sent.append((reply.content, message.user_id, message.session_id))
+    channel._handle_message_event(_text_event(text="/approve abcdef12 session", open_id="ou_abc"))
+
+    assert channel.sessions == {}
+    assert agent.calls == [("approve", "abcdef12", "ou_abc", "session")]
+    assert sent == [("已批准 [abcdef12]", "ou_abc", "feishu:ou_abc")]
+
+
+def test_group_other_user_cannot_approve(settings_factory, tmp_path):
+    from tools.approval import ApprovalGate
+    from tools.policy import ToolRequest
+
+    channel = _channel(settings_factory, tmp_path)
+    sent = []
+    gate = ApprovalGate(timeout_seconds=2)
+    pending = gate.submit(
+        ToolRequest(
+            name="bash",
+            arguments={"command": "python -c pass"},
+            risk_level="L2",
+            user_id="ou_owner",
+            session_id="feishu:oc_group",
+        )
+    )
+
+    class GateAgent:
+        def approve_tool(self, approval_id, user_id, scope="once"):
+            return gate.approve(approval_id, user_id, scope)[1]
+
+        def run(self, *args, **kwargs):
+            raise AssertionError("approval slash must not enter Agent.run")
+
+    channel.agent = GateAgent()
+    channel.send = lambda reply, message: sent.append((reply.content, message.user_id))
+    channel._handle_message_event(_text_event(
+        text=f"/approve {pending.approval_id}",
+        msg_id="m-other",
+        chat_type="group",
+        open_id="ou_other",
+        mentions=[{"key": "@_user_1"}],
+        chat_id="oc_group",
+    ))
+
+    assert channel.sessions == {}
+    assert sent == [("无权审批该操作", "ou_other")]
+    assert gate.pending_ids() == [pending.approval_id]
+
+    channel._handle_message_event(_text_event(
+        text=f"/approve {pending.approval_id}",
+        msg_id="m-owner",
+        chat_type="group",
+        open_id="ou_owner",
+        mentions=[{"key": "@_user_1"}],
+        chat_id="oc_group",
+    ))
+    assert sent[-1] == (f"已批准 [{pending.approval_id}]（仅本次）", "ou_owner")
+    assert gate.pending_ids() == []
+
+
 def test_duplicate_msg_id_ignored(settings_factory, tmp_path):
     channel = _channel(settings_factory, tmp_path)
     channel._handle_message_event(_text_event(msg_id="dup"))

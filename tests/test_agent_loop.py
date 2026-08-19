@@ -197,3 +197,25 @@ def test_agent_max_steps_fallback(settings_factory, tmp_path):
     assert raw_records[-1]["metadata"]["reason"] == "max_steps_reached"
     assert any(e["name"] == "max_steps_reached" for e in trace.events)
     agent.memory.close()
+
+
+def test_summarize_session_compacts_without_agent_loop(settings_factory, tmp_path):
+    _prepare_project(tmp_path)
+    settings = settings_factory(
+        project_root=tmp_path,
+        workspace=tmp_path / "workspace",
+        keep_recent_turns=1,
+        model_context_window=100000,
+    )
+    agent = Agent(settings)
+    agent.llm = FakeLLM("agent-summary")
+    manager = agent._get_context_manager("cli:local")
+    manager.append_user_message("u0")
+    manager.append_assistant_message({"role": "assistant", "content": "a0"})
+    manager.append_user_message("u1")
+    manager.append_assistant_message({"role": "assistant", "content": "a1"})
+
+    assert agent.summarize_session("cli:local") == "已压缩"
+    assert "agent-summary" in manager.history[0]["content"]
+    assert agent.summarize_session("fresh") == "无需压缩"
+    agent.memory.close()

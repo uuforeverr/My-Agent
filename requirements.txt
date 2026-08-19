@@ -6,3 +6,4 @@
 # - croniter: cron-based scheduler tasks and daily dream scheduling
 lark-oapi>=1.6,<2.0
 croniter>=6.0,<7.0
+tiktoken>=0.7,<1.0

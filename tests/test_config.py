@@ -42,6 +42,9 @@ def test_load_settings_defaults_and_casts(monkeypatch, tmp_path):
     monkeypatch.setenv("DAILY_DREAM_ENABLED", "true")
     monkeypatch.setenv("DAILY_DREAM_CRON", "0 3 * * *")
     monkeypatch.setenv("DAILY_DREAM_LOOKBACK_DAYS", "2")
+    monkeypatch.delenv("TOOL_APPROVAL_MODE", raising=False)
+    monkeypatch.delenv("MODEL_CONTEXT_WINDOW", raising=False)
+    monkeypatch.delenv("KEEP_RECENT_TURNS", raising=False)
 
     settings = load_settings()
 
@@ -61,3 +64,33 @@ def test_load_settings_defaults_and_casts(monkeypatch, tmp_path):
     assert settings.daily_dream_enabled is True
     assert settings.daily_dream_cron == "0 3 * * *"
     assert settings.daily_dream_lookback_days == 2
+    assert settings.tool_approval_mode == "off"
+    assert settings.model_context_window is None
+    assert settings.keep_recent_turns == 3
+
+
+def test_load_settings_tool_approval_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE", str(tmp_path / "w"))
+    monkeypatch.setenv("TOOL_APPROVAL_MODE", "on")
+    assert load_settings().tool_approval_mode == "on"
+
+    monkeypatch.setenv("TOOL_APPROVAL_MODE", "ON")
+    assert load_settings().tool_approval_mode == "on"
+
+    monkeypatch.setenv("TOOL_APPROVAL_MODE", "true")
+    assert load_settings().tool_approval_mode == "off"
+
+
+def test_load_settings_compaction_window_and_turns(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE", str(tmp_path / "w"))
+    monkeypatch.setenv("MODEL_CONTEXT_WINDOW", "1000")
+    monkeypatch.setenv("KEEP_RECENT_TURNS", "5")
+    settings = load_settings()
+    assert settings.model_context_window == 1000
+    assert settings.keep_recent_turns == 5
+
+    monkeypatch.setenv("MODEL_CONTEXT_WINDOW", "not-a-number")
+    monkeypatch.setenv("KEEP_RECENT_TURNS", "0")
+    settings = load_settings()
+    assert settings.model_context_window is None
+    assert settings.keep_recent_turns == 1

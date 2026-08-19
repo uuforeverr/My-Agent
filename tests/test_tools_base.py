@@ -60,3 +60,11 @@ def test_schema_shape(tmp_workspace: Path):
     assert schema["type"] == "function"
     assert schema["function"]["name"] == "echo"
     assert "parameters" in schema["function"]
+
+
+def test_default_risk_fields(tmp_workspace: Path):
+    tool = _EchoTool(tmp_workspace)
+    assert tool.risk_level == "L0"
+    assert tool.requires_approval is None
+    assert tool.idempotent is True
+    assert tool.risk_for({}) == "L0"

@@ -1,7 +1,10 @@
+import difflib
 from pathlib import Path
 from typing import Any, Optional
 
 from tools.base import BaseTool, ToolError, ToolResult
+
+L1_DIFF_PREVIEW_LINES = 40
 
 
 MAX_READ_CHARS = 60000
@@ -25,6 +28,8 @@ class GlobTool(BaseTool):
         },
         "required": ["pattern"],
     }
+    risk_level = "L0"
+    idempotent = True
 
     def execute(self, arguments: dict[str, Any]) -> str:
         pattern = str(arguments.get("pattern", "")).strip()
@@ -79,6 +84,8 @@ class ReadFileTool(BaseTool):
         },
         "required": ["path"],
     }
+    risk_level = "L0"
+    idempotent = True
 
     def run(self, arguments: dict[str, Any], context: Any = None) -> ToolResult:
         target = self._skill_activation_target(arguments)
@@ -159,6 +166,8 @@ class WriteFileTool(BaseTool):
         },
         "required": ["path", "content"],
     }
+    risk_level = "L1"
+    idempotent = False
 
     def execute(self, arguments: dict[str, Any]) -> str:
         path = self.resolve_workspace_path(arguments.get("path", ""))
@@ -169,6 +178,21 @@ class WriteFileTool(BaseTool):
         text = str(content)
         path.write_text(text, encoding="utf-8")
         return f"written: {path.relative_to(self.workspace)} ({len(text.encode('utf-8'))} bytes)"
+
+    def trace_preview(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_path = arguments.get("path", "")
+        try:
+            path = self.resolve_workspace_path(str(raw_path or ""))
+            rel = path.relative_to(self.workspace).as_posix()
+            exists = path.exists()
+        except Exception as e:
+            return {"path": str(raw_path), "error": str(e)}
+        text = str(arguments.get("content") or "")
+        return {
+            "path": rel,
+            "bytes": len(text.encode("utf-8")),
+            "new_file": not exists,
+        }
 
 
 class EditFileTool(BaseTool):
@@ -192,6 +216,8 @@ class EditFileTool(BaseTool):
         },
         "required": ["path", "old_text", "new_text"],
     }
+    risk_level = "L1"
+    idempotent = False
 
     def execute(self, arguments: dict[str, Any]) -> str:
         path = self.resolve_workspace_path(arguments.get("path", ""))
@@ -229,6 +255,46 @@ class EditFileTool(BaseTool):
         path.write_text(updated, encoding="utf-8")
         rel = path.relative_to(self.workspace)
         return f"edited: {rel} (first_changed_line={first_changed_line})"
+
+    def trace_preview(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_path = arguments.get("path", "")
+        try:
+            path = self.resolve_workspace_path(str(raw_path or ""))
+            rel = path.relative_to(self.workspace).as_posix()
+        except Exception as e:
+            return {"path": str(raw_path), "error": str(e)}
+        if not path.exists() or not path.is_file():
+            return {"path": rel, "error": "file not found"}
+        old_text = arguments.get("old_text", arguments.get("oldText"))
+        new_text = arguments.get("new_text", arguments.get("newText"))
+        if old_text is None or new_text is None:
+            return {"path": rel, "error": "missing old_text/new_text"}
+        try:
+            content = path.read_text(encoding="utf-8")
+            old = str(old_text)
+            new = str(new_text)
+            if old == "":
+                updated = _append_text(content, new)
+            else:
+                if content.count(old) != 1:
+                    return {"path": rel, "error": "old_text count mismatch"}
+                updated = content.replace(old, new, 1)
+        except Exception as e:
+            return {"path": rel, "error": str(e)}
+        diff_lines = list(
+            difflib.unified_diff(
+                content.splitlines(),
+                updated.splitlines(),
+                fromfile=rel,
+                tofile=rel,
+                lineterm="",
+            )
+        )
+        return {
+            "path": rel,
+            "diff_preview": "\n".join(diff_lines[:L1_DIFF_PREVIEW_LINES]),
+            "diff_lines": len(diff_lines),
+        }
 
 
 def _select_lines(

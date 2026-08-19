@@ -173,6 +173,27 @@ def test_handle_sends_assistant_progress_before_final(settings_factory, tmp_path
     ]
 
 
+def test_handle_sends_approval_request_before_final(settings_factory, tmp_path):
+    settings = settings_factory(workspace=tmp_path / "w")
+
+    class ApprovalProgressAgent:
+        def run(self, content, context=None, on_event=None):
+            on_event({
+                "type": "approval_request",
+                "content": "待审批 [abcdef12]\n工具: bash    等级: L2",
+                "approval_id": "abcdef12",
+            })
+            return "已执行", "trace-obj"
+
+    channel = RecordingChannel(agent=ApprovalProgressAgent(), settings=settings)
+    channel._handle(_msg("a", content="run tests", channel_type="cli"))
+
+    assert channel.sent == [
+        ("cli:a", "待审批 [abcdef12]\n工具: bash    等级: L2"),
+        ("cli:a", "已执行"),
+    ]
+
+
 def test_handle_persists_success_trace(settings_factory, tmp_path):
     settings = settings_factory(workspace=tmp_path / "w")
 

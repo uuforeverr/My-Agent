@@ -40,6 +40,9 @@ class WebSearchTool(BaseTool):
         },
         "required": ["query"],
     }
+    risk_level = "L2"
+    requires_approval = False
+    idempotent = True
 
     def __init__(
         self,

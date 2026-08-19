@@ -2,11 +2,11 @@
 
 # My-Agent
 
-**多渠道对话、工具调用、长期记忆、定时任务，以及可查询的完整运行链路。**
+**多渠道对话、工具调用、风险审批、会话压缩、长期记忆、定时任务，以及可查询的完整运行链路。**
 
 一个面向学习与工程实践的轻量级 AI Agent。
 
-[功能](#功能概览) · [快速开始](#快速开始) · [飞书](#飞书接入) · [观测](#可观测性) · [文档](#文档地址) · [FAQ](#常见问题)
+[功能](#功能概览) · [快速开始](#快速开始) · [飞书](#飞书接入) · [工具审批](#工具审批) · [压缩](#上下文压缩) · [观测](#可观测性) · [文档](#文档地址) · [FAQ](#常见问题)
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)
 ![Stars](https://img.shields.io/github/stars/uuforeverr/My-Agent?style=flat)
@@ -19,12 +19,13 @@
 `my-agent` 不只是一个聊天 Demo。项目围绕 Agent 在真实运行中需要回答的几个问题展开：
 
 - Agent 调用了什么工具，为什么失败？
-- 多轮对话如何隔离、裁剪和沉淀为长期记忆？
+- 多轮对话如何隔离、按条数/token 压缩，并沉淀为长期记忆？
+- 高风险工具如何在执行前等人确认，调度任务如何挂起等待？
 - Agent 如何主动执行提醒或周期任务，并把结果送回原渠道？
 - 文件和 Shell 工具如何限制在指定工作区内？
 - 一次请求的 LLM、工具和渠道耗时如何被记录、查询和展示？
 
-> 当前项目适合本地学习、原型验证和 Agent 工程能力演示，尚未实现完整的用户认证、RBAC、工具审批与分布式调度，不建议未经加固直接暴露在公网或用于生产环境。
+> 当前项目适合本地学习、原型验证和 Agent 工程能力演示。工具审批默认关闭（`TOOL_APPROVAL_MODE=off`）；尚未实现完整的用户认证、RBAC 与分布式调度，不建议未经加固直接暴露在公网或用于生产环境。
 
 ## 功能概览
 
@@ -32,15 +33,16 @@
 | --- | --- | --- |
 | Agent Loop | OpenAI-compatible 模型调用、多步工具执行、最大步数保护 | 已实现 |
 | 多渠道接入 | CLI；飞书 WebSocket 长连接、私聊与群聊 `@Bot` 响应 | 已实现 |
-| 上下文管理 | 按会话隔离上下文，超长对话自动裁剪 | 已实现 |
+| 上下文管理 | 按会话隔离；条数或 token 超限时用摘要压缩，保留最近完整 turn | 已实现 |
+| 工具审批 | 风险分级 L0–L3；默认 off；on 时 L2/L3 需 `/approve` `/deny`；调度任务可挂起 | 已实现 |
 | 长期记忆 | 原始对话、情景记忆、语义记忆、SQLite FTS 检索、按需注入 | 已实现 |
 | 记忆整理 | 异步生成 daily memory、每日 Dream 整理、工作流 SOP 提炼 | 已实现 |
-| 内置工具 | Bash、文件读写与编辑、Glob、记忆、联网搜索、定时任务 | 已实现 |
+| 内置工具 | Bash（argv 白名单）、文件读写与编辑、Glob、记忆、联网搜索、定时任务 | 已实现 |
 | 本地技能 | 从 `skills/` 加载 `SKILL.md` 并注入上下文 | 已实现 |
 | 主动任务 | 一次性提醒、固定间隔任务、Cron 任务，结果回送原渠道 | 已实现 |
 | 可观测性 | Trace/Span、LLM 与工具耗时、Token 用量、错误信息、敏感字段脱敏 | 已实现 |
 | Trace Explorer | 本地 Web 面板、历史筛选、Span 树、调试包、SQLite 索引修复 | 已实现 |
-| 安全边界 | Workspace 路径约束、Shell 危险命令拦截、子进程环境变量白名单 | 已实现 |
+| 安全边界 | Workspace 路径约束、Bash 命令白名单、子进程环境变量白名单 | 已实现 |
 
 ## 技术栈
 
@@ -50,10 +52,11 @@
 | OpenAI-compatible HTTP | 标准库 `urllib` | 模型调用，兼容自定义 `OPENAI_API_BASE` |
 | lark-oapi | `>=1.6,<2.0` | 飞书 WebSocket 长连接渠道 |
 | croniter | `>=6.0,<7.0` | Cron 任务与每日 Dream |
+| tiktoken | `>=0.7,<1.0` | 上下文 token 计数与压缩触发 |
 | SQLite FTS | 标准库 | 情景记忆检索、Trace 查询索引 |
 | pytest | `>=8.0,<9.0` | 离线 / 安全 / 性能 / Live 测试 |
 
-CLI 核心路径尽量依赖标准库；飞书渠道和 Cron 调度通过 `requirements.txt` 引入。
+CLI 核心路径尽量依赖标准库；飞书渠道、Cron 调度和 token 计数通过 `requirements.txt` 引入。
 
 ## 工作原理
 
@@ -66,6 +69,7 @@ flowchart LR
     C --> S[SkillLoader]
     A --> L[OpenAI-compatible LLM]
     L -->|tool calls| T[ToolRegistry]
+    T --> P[ToolPolicy / ApprovalGate]
     T --> W[Workspace / Web Search / Scheduler]
     A --> O[Trace Store]
     O --> J[JSONL 审计日志]
@@ -81,8 +85,9 @@ flowchart LR
 Channel 收到消息
   -> 为 session 创建 RunContext
   -> ContextManager 组装身份、记忆、技能和历史消息
+     （超条数或 token 预算时压缩旧消息，保留最近完整 turn）
   -> LLM 决定直接回复或调用工具
-  -> ToolRegistry 在安全边界内执行工具
+  -> ToolRegistry 先过策略再执行；需要审批时推送文案并等待 /approve
   -> Agent 继续推理，直到返回答案或达到 max_steps
   -> Channel 回复用户
   -> Trace 同时写入 JSONL 和 SQLite
@@ -165,7 +170,7 @@ python3 main.py
 30 分钟后提醒我检查测试结果
 ```
 
-输入 `exit` 或 `quit` 退出。
+输入 `exit` 或 `quit` 退出。常用斜杠命令见下文「工具审批」和「长期记忆」。
 
 ## 配置说明
 
@@ -186,7 +191,10 @@ python3 main.py
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MAX_HISTORY_MESSAGES` | `40` | 单个会话保留的短期历史消息数 |
+| `MAX_HISTORY_MESSAGES` | `40` | 单个会话短期历史条数上限；超过则触发压缩 |
+| `MODEL_CONTEXT_WINDOW` | 空 | 可选，显式模型窗口（token）。未设时按模型名前缀查表，未知模型回退 `32768` |
+| `KEEP_RECENT_TURNS` | `3` | 压缩时保留的最近完整 turn 数（一条 user 及其后的 assistant/tool） |
+| `TOOL_APPROVAL_MODE` | `off` | `off` 全部放行；`on` 按风险等级审批。仅当值为 `on` 时开启 |
 | `MEMORY_SEARCH_RESULTS` | `5` | 每次注入的情景记忆检索结果数 |
 | `MEMORY_FLUSH_MESSAGES` | `12` | 一次异步记忆摘要处理的最大消息数 |
 | `BASH_TIMEOUT` | `20` | Bash 默认超时秒数，代码硬限制最大 30 秒 |
@@ -235,15 +243,15 @@ FEISHU_APP_SECRET=your-app-secret
 python3 main.py
 ```
 
-私聊消息会直接进入 Agent；群聊仅响应明确 `@Bot` 的文本消息。代码包含消息去重、过期消息过滤和 WebSocket 断线重连。
+私聊消息会直接进入 Agent；群聊仅响应明确 `@Bot` 的文本消息。`/approve`、`/deny`、`/summarize` 在渠道层拦截，不进入 Agent 对话。群聊中只有发起该次工具调用的用户可以审批。代码包含消息去重、过期消息过滤和 WebSocket 断线重连。
 
 ## 内置工具
 
 | 工具 | 用途 | 可用条件 |
 | --- | --- | --- |
-| `bash` | 在 Workspace 中运行短时非交互命令 | 默认启用 |
+| `bash` | 在 Workspace 中按 argv 运行白名单命令；超长输出溢写到文件 | 默认启用 |
 | `glob` | 按模式查找文件 | 默认启用 |
-| `read_file` | 读取 Workspace 内文件 | 默认启用 |
+| `read_file` | 读取 Workspace 内文件（支持 offset/limit） | 默认启用 |
 | `write_file` | 写入 Workspace 内文件 | 默认启用 |
 | `edit_file` | 精确编辑 Workspace 内文件 | 默认启用 |
 | `remember_memory` | 写入长期语义记忆 | 默认启用 |
@@ -252,9 +260,58 @@ python3 main.py
 | `web_search` | 百度千帆联网搜索 | 配置 `QIANFAN_API_KEY` |
 | `scheduler` | 创建、查询、更新和删除任务 | `SCHEDULER_ENABLED=true` |
 
-文件工具会解析并校验真实路径，拒绝访问 Workspace 外部。Bash 工具还会过滤凭证相关命令、绝对路径、路径穿越、提权和部分高危系统命令，并限制超时与输出长度。
+文件工具会解析并校验真实路径，拒绝访问 Workspace 外部。
 
-这些规则是基础防护，不等同于容器沙箱或人工审批。运行来源不可信的提示词前，应使用独立低权限环境。
+`bash` 使用 `shell=False`：先 `shlex.split`，禁止管道/重定向/命令链，`argv[0]` 必须是白名单短名（`python` / `python3` / `py` / `pytest` / `pip` / `git` / `rg` / `node` / `npm` / `npx` / `ruff` / `mypy`），再用 `shutil.which` 解析后执行。不包含 `echo`、`cat`、`curl` 等；短文本请用 `python -c`。凭证、绝对路径、路径穿越、提权和删根等黑名单仍作为第二道闸。超时上限 30 秒。
+
+工具成功输出超过 **2000 tokens** 时，全文写入 `workspace/.agent/tool_outputs/`，返回给模型的是头尾预览加路径，可用 `read_file` 的 offset/limit 续读。`read_file` 本身不重复溢写。`.agent/` 已被 Git 忽略。
+
+这些规则是基础防护，不等同于容器沙箱。默认 `TOOL_APPROVAL_MODE=off` 时不会弹出人工审批。运行来源不可信的提示词前，应使用独立低权限环境，并考虑打开审批。
+
+## 工具审批
+
+默认 `TOOL_APPROVAL_MODE=off`，行为与打开审批前一致。生产或本地想拦截高风险调用时设为 `on`：
+
+```dotenv
+TOOL_APPROVAL_MODE=on
+```
+
+| 等级 | `on` 时的行为 | 典型工具 |
+| --- | --- | --- |
+| L0 | 直接执行 | `glob`、`read_file`、`memory_search`、`read_memory`、`scheduler.list/get` |
+| L1 | 直接执行；写文件预览只记 Trace，不推渠道 | `write_file`、`edit_file`、`remember_memory` |
+| L2 | 交互会话等待审批；调度任务挂起 | `bash`、`scheduler.create/delete/enable/disable` |
+| L2 网络只读 | 执行并记 Trace，不审批 | `web_search` |
+| L3 | 与 L2 相同（本轮无独立 L3 工具） | 预留 |
+
+交互路径超时 **120 秒**视为拒绝且工具未执行。调度任务不阻塞扫描线程，进入 `waiting_approval`，超时 **24 小时**；批准后在线程池里续跑，拒绝或进程重启会使本次失败（once 任务 disable，周期任务前进到下次）。
+
+CLI / 飞书（不进入 Agent 对话）：
+
+```text
+/approve <id>           # 仅批准这一次
+/approve <id> session   # 本会话允许同类工具再次执行
+/deny <id>              # 拒绝
+```
+
+审批文案含操作 ID、工具名、风险等级和脱敏后的参数。敏感字段会 redacted。
+
+## 上下文压缩
+
+组装发给模型的消息时，满足任一条件就会压缩：
+
+- 短期 history 条数超过 `MAX_HISTORY_MESSAGES`（默认 40）
+- 本次 payload（system + history + 工具 schema）超过模型窗口的 **80%**（可用 `MODEL_CONTEXT_WINDOW` 覆盖窗口）
+
+压缩只处理旧消息：最近 `KEEP_RECENT_TURNS`（默认 3）个完整 turn 原样保留。被替换的旧消息写成一条 `conversation_summary` 留在 history 里，并仍会 `flush` 到 daily 情景记忆。压缩 LLM 失败时不丢 history。
+
+手动触发（渠道拦截，不进 Agent.run）：
+
+```text
+/summarize
+```
+
+token 计数使用 tiktoken。未知模型不抛错，窗口回退 32768。
 
 ## 长期记忆
 
@@ -272,7 +329,7 @@ data/memory/
 
 - 语义记忆会完整注入上下文。
 - 情景记忆根据当前问题 Top-K 检索后注入。
-- 上下文裁剪时，旧消息会异步总结到 daily memory。
+- 会话压缩替换掉的旧消息，仍会异步总结到 daily memory。
 - Daily Dream 会整理近期记忆并重写长期语义记忆。
 
 CLI 管理命令：
@@ -281,6 +338,7 @@ CLI 管理命令：
 /dream      # 立即整理最近一天的记忆
 /sop        # 提炼最近 3 天的工作流
 /sop 7      # 提炼最近 7 天的工作流
+/summarize  # 手动压缩当前会话（不进 Agent 对话）
 ```
 
 ## 定时任务
@@ -305,7 +363,9 @@ Agent 支持三种调度方式：
 每天早上 9 点总结今天的待办事项
 ```
 
-调度任务保存在 `data/scheduler/tasks.json`，并通过原始 Channel 主动回送结果。定时 Agent 任务中会隐藏 `scheduler`，防止任务递归创建任务。
+调度任务保存在 `data/scheduler/tasks.json`，并通过原始 Channel 主动回送结果。定时 Agent 任务中会隐藏 `scheduler`，防止任务递归创建任务。`memory_dream` / `send_message` 不走工具审批。
+
+`TOOL_APPROVAL_MODE=on` 时，到期任务里的 L2/L3 不会卡住扫描线程，而是把任务标为 `waiting_approval`，向原渠道发送审批文案；`/approve` 后再续跑并投递结果。
 
 ## 可观测性
 
@@ -314,7 +374,8 @@ Agent 支持三种调度方式：
 - `channel.handle` / `channel.send`
 - `agent.invoke`
 - `llm.chat`
-- `tool.execute`
+- `tool.execute` / `tool.policy`
+- `context.compact`
 
 Trace 包含执行状态、耗时、模型、Token 用量、工具结果大小和错误信息。序列化时会对 `api_key`、`token`、`secret`、`authorization`、`password`、`cookie` 等敏感字段脱敏。
 
@@ -428,14 +489,14 @@ RUN_LIVE_LLM=1 python3 -m pytest -m live
 
 ```text
 my-agent/
-├── agent/             # Agent Loop、上下文与运行上下文
+├── agent/             # Agent Loop、上下文压缩与运行上下文
 ├── channel/           # CLI、飞书与渠道调度
 ├── llm/               # OpenAI-compatible HTTP 客户端
 ├── memory/            # 多层记忆、检索、Dream 与 SOP
 ├── observability/     # Trace、SQLite、API 与 Web 面板
 ├── scheduler/         # 任务存储、时间计算、执行与后台扫描
 ├── skills/            # 本地 SKILL.md 加载
-├── tools/             # 工具定义、注册与安全边界
+├── tools/             # 工具定义、风险策略、审批与安全边界
 ├── prompts/           # 文件化身份提示词
 ├── tests/             # 离线、性能、安全及 Live 测试
 ├── docs/              # 设计说明、路线与测试文档
@@ -459,6 +520,7 @@ my-agent/
 | [`docs/scheduler-design-for-beginners.md`](docs/scheduler-design-for-beginners.md) | 调度入门 |
 | [`docs/agent-observability-control-plane.md`](docs/agent-observability-control-plane.md) | 观测控制面 |
 | [`docs/minimal-implementation-roadmap.md`](docs/minimal-implementation-roadmap.md) | 最小化实现路线 |
+| [`docs/tool-policy-and-context-compaction-plan.md`](docs/tool-policy-and-context-compaction-plan.md) | 工具审批与上下文压缩方案 |
 | [`docs/test-plan.md`](docs/test-plan.md) / [`docs/test-report.md`](docs/test-report.md) | 测试计划与报告 |
 
 ## 常见问题
@@ -501,22 +563,22 @@ my-agent/
 <details>
 <summary>可以把服务直接挂到公网吗？</summary>
 
-不建议。当前没有完整用户认证、RBAC、工具审批和分布式调度；文件与 Shell 工具也只是 Workspace 级防护。请在本地或隔离环境运行。
+不建议。当前没有完整用户认证、RBAC 和分布式调度；工具审批默认关闭（`TOOL_APPROVAL_MODE=off`），文件与 Shell 工具也只是 Workspace 级防护。请在本地或隔离环境运行。
 
 </details>
 
 ## 当前边界与路线
 
-已实现的是单机 Agent 执行内核和本地观测闭环。后续重点方向：
+已实现的是单机 Agent 执行内核、本地观测闭环，以及工具风险分级、执行前审批和会话压缩。后续重点方向：
 
-1. 工具风险分级、执行前审批与变更 Diff。
+1. 飞书交互卡片 / 团队 Web 审批工作台。
 2. Workflow/Step 一等模型及显式状态机。
 3. 幂等执行、重试策略、超时恢复与可靠调度。
 4. Workspace、用户身份、RBAC 与集中式密钥管理。
 5. OpenTelemetry 标准接入和基于 Trace 的 Agent Eval。
 6. Docker Compose 自托管部署与团队 Web 工作台。
 
-更多设计背景见 [`docs/`](docs/)。
+更多设计背景见 [`docs/`](docs/)，本期方案见 [`docs/tool-policy-and-context-compaction-plan.md`](docs/tool-policy-and-context-compaction-plan.md)。
 
 ## 作者联系
 
@@ -528,7 +590,7 @@ my-agent/
 | --- | --- |
 | 仓库 | [uuforeverr/My-Agent](https://github.com/uuforeverr/My-Agent) |
 | 主要语言 | Python |
-| 运行依赖 | `lark-oapi`、`croniter`（CLI 核心走标准库） |
+| 运行依赖 | `lark-oapi`、`croniter`、`tiktoken`（CLI 核心走标准库） |
 
 ## License
 
