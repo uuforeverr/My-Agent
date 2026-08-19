@@ -1,6 +1,20 @@
-# my-agent
+<div align="center">
 
-一个面向学习与工程实践的轻量级 AI Agent：支持多渠道对话、工具调用、长期记忆、定时任务，以及可查询的完整运行链路。
+# My-Agent
+
+**多渠道对话、工具调用、长期记忆、定时任务，以及可查询的完整运行链路。**
+
+一个面向学习与工程实践的轻量级 AI Agent。
+
+[功能](#功能概览) · [快速开始](#快速开始) · [飞书](#飞书接入) · [观测](#可观测性) · [文档](#文档地址) · [FAQ](#常见问题)
+
+![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)
+![Stars](https://img.shields.io/github/stars/uuforeverr/My-Agent?style=flat)
+![Last Commit](https://img.shields.io/github/last-commit/uuforeverr/My-Agent)
+![Issues](https://img.shields.io/github/issues/uuforeverr/My-Agent)
+![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
+
+</div>
 
 `my-agent` 不只是一个聊天 Demo。项目围绕 Agent 在真实运行中需要回答的几个问题展开：
 
@@ -14,18 +28,32 @@
 
 ## 功能概览
 
-| 模块 | 能力 |
-| --- | --- |
-| Agent Loop | OpenAI-compatible 模型调用、多步工具执行、最大步数保护 |
-| 多渠道接入 | CLI；飞书 WebSocket 长连接、私聊与群聊 `@Bot` 响应 |
-| 上下文管理 | 按会话隔离上下文，超长对话自动裁剪 |
-| 长期记忆 | 原始对话、情景记忆、语义记忆、SQLite FTS 检索、按需注入 |
-| 记忆整理 | 异步生成 daily memory、每日 Dream 整理、工作流 SOP 提炼 |
-| 内置工具 | Bash、文件读写与编辑、Glob、记忆、联网搜索、定时任务 |
-| 主动任务 | 一次性提醒、固定间隔任务、Cron 任务，结果回送原渠道 |
-| 可观测性 | Trace/Span、LLM 与工具耗时、Token 用量、错误信息、敏感字段脱敏 |
-| Trace Explorer | 本地 Web 面板、历史筛选、Span 树、调试包、SQLite 索引修复 |
-| 安全边界 | Workspace 路径约束、Shell 危险命令拦截、子进程环境变量白名单 |
+| 模块 | 能力 | 状态 |
+| --- | --- | --- |
+| Agent Loop | OpenAI-compatible 模型调用、多步工具执行、最大步数保护 | 已实现 |
+| 多渠道接入 | CLI；飞书 WebSocket 长连接、私聊与群聊 `@Bot` 响应 | 已实现 |
+| 上下文管理 | 按会话隔离上下文，超长对话自动裁剪 | 已实现 |
+| 长期记忆 | 原始对话、情景记忆、语义记忆、SQLite FTS 检索、按需注入 | 已实现 |
+| 记忆整理 | 异步生成 daily memory、每日 Dream 整理、工作流 SOP 提炼 | 已实现 |
+| 内置工具 | Bash、文件读写与编辑、Glob、记忆、联网搜索、定时任务 | 已实现 |
+| 本地技能 | 从 `skills/` 加载 `SKILL.md` 并注入上下文 | 已实现 |
+| 主动任务 | 一次性提醒、固定间隔任务、Cron 任务，结果回送原渠道 | 已实现 |
+| 可观测性 | Trace/Span、LLM 与工具耗时、Token 用量、错误信息、敏感字段脱敏 | 已实现 |
+| Trace Explorer | 本地 Web 面板、历史筛选、Span 树、调试包、SQLite 索引修复 | 已实现 |
+| 安全边界 | Workspace 路径约束、Shell 危险命令拦截、子进程环境变量白名单 | 已实现 |
+
+## 技术栈
+
+| 技术 | 版本 | 用途 |
+| --- | --- | --- |
+| Python | 3.9+ | 运行时 |
+| OpenAI-compatible HTTP | 标准库 `urllib` | 模型调用，兼容自定义 `OPENAI_API_BASE` |
+| lark-oapi | `>=1.6,<2.0` | 飞书 WebSocket 长连接渠道 |
+| croniter | `>=6.0,<7.0` | Cron 任务与每日 Dream |
+| SQLite FTS | 标准库 | 情景记忆检索、Trace 查询索引 |
+| pytest | `>=8.0,<9.0` | 离线 / 安全 / 性能 / Live 测试 |
+
+CLI 核心路径尽量依赖标准库；飞书渠道和 Cron 调度通过 `requirements.txt` 引入。
 
 ## 工作原理
 
@@ -97,11 +125,12 @@ python3 -m pip install -r requirements-dev.txt
 ### 2. 获取项目
 
 ```bash
-git clone https://github.com/uu999/My-Agent.git
+git clone https://github.com/uuforeverr/My-Agent.git
 cd My-Agent
 
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate          # Linux / macOS
+# .venv\Scripts\activate           # Windows
 python3 -m pip install -r requirements.txt
 ```
 
@@ -176,6 +205,12 @@ python3 main.py
 | `DAILY_DREAM_ENABLED` | `true` | 是否注册每日记忆整理任务 |
 | `DAILY_DREAM_CRON` | `0 0 * * *` | 每日记忆整理的 Cron 表达式 |
 | `DAILY_DREAM_LOOKBACK_DAYS` | `1` | 每次整理回看的情景记忆天数 |
+
+### 可观测性
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `TRACE_API_TOKEN` | 空 | Trace Explorer 可选访问令牌；为空时本地面板不校验 Token |
 
 ## 飞书接入
 
@@ -345,7 +380,20 @@ POST /api/index/rebuild
 
 SQLite 查询缺失时会回查 JSONL 并修复索引；也可以通过 API 手动增量修复或完整重建。
 
-## 测试
+## 开发指南
+
+### 本地开发
+
+```bash
+git clone https://github.com/uuforeverr/My-Agent.git
+cd My-Agent
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements-dev.txt
+cp .env.example .env
+```
+
+### 测试
 
 安装测试依赖并运行完整离线测试：
 
@@ -366,6 +414,15 @@ python3 -m pytest -m performance
 ```bash
 RUN_LIVE_LLM=1 python3 -m pytest -m live
 ```
+
+### 贡献指南
+
+欢迎 Issue 与 Pull Request。建议：
+
+1. Fork 本仓库并新建分支。
+2. 改动尽量小，优先复用现有 `agent/`、`tools/`、`observability/` 风格。
+3. 涉及安全边界、调度或记忆的改动，请补充对应测试。
+4. 不要提交 `.env`、真实密钥、本地 `data/` 运行产物。
 
 ## 项目结构
 
@@ -390,6 +447,64 @@ my-agent/
 └── main.py            # 进程入口
 ```
 
+## 文档地址
+
+设计说明、路线与测试文档都在 [`docs/`](docs/)：
+
+| 文档 | 说明 |
+| --- | --- |
+| [`docs/python-code-walkthrough.md`](docs/python-code-walkthrough.md) | 代码走读 |
+| [`docs/memory-architecture.md`](docs/memory-architecture.md) | 记忆架构 |
+| [`docs/channel-design-walkthrough.md`](docs/channel-design-walkthrough.md) | 渠道设计 |
+| [`docs/scheduler-design-for-beginners.md`](docs/scheduler-design-for-beginners.md) | 调度入门 |
+| [`docs/agent-observability-control-plane.md`](docs/agent-observability-control-plane.md) | 观测控制面 |
+| [`docs/minimal-implementation-roadmap.md`](docs/minimal-implementation-roadmap.md) | 最小化实现路线 |
+| [`docs/test-plan.md`](docs/test-plan.md) / [`docs/test-report.md`](docs/test-report.md) | 测试计划与报告 |
+
+## 常见问题
+
+<details>
+<summary>没有配置 API Key 能启动吗？</summary>
+
+可以启动 CLI / 飞书渠道进程，但模型调用会失败。至少填写 `OPENAI_API_KEY`；使用中转时同时设置 `OPENAI_API_BASE` 和 `MODEL`。
+
+</details>
+
+<details>
+<summary>飞书机器人不回复？</summary>
+
+确认 `CHANNELS` 包含 `feishu`，`FEISHU_APP_ID` / `FEISHU_APP_SECRET` 正确，应用已开通收发消息权限，并订阅 `im.message.receive_v1`。群聊只会响应明确 `@Bot` 的文本消息；私聊会直接进入 Agent。
+
+</details>
+
+<details>
+<summary>为什么模型看不到 web_search？</summary>
+
+未配置 `QIANFAN_API_KEY` 时，联网搜索工具会从工具列表中隐藏，避免模型调用不可用能力。
+
+</details>
+
+<details>
+<summary>Cron 任务或每日 Dream 不生效？</summary>
+
+确认已安装 `requirements.txt`（包含 `croniter`），且 `SCHEDULER_ENABLED=true`。Daily Dream 还需要 `DAILY_DREAM_ENABLED=true`。任务文件默认在 `data/scheduler/tasks.json`。
+
+</details>
+
+<details>
+<summary>Trace Explorer 打不开或接口 401？</summary>
+
+先启动 `python3 -m observability.api --host 127.0.0.1 --port 8765`，再访问 `http://127.0.0.1:8765/dashboard`。若设置了 `TRACE_API_TOKEN`，请求需带 `Authorization: Bearer <token>` 或 `X-Trace-Api-Token`。
+
+</details>
+
+<details>
+<summary>可以把服务直接挂到公网吗？</summary>
+
+不建议。当前没有完整用户认证、RBAC、工具审批和分布式调度；文件与 Shell 工具也只是 Workspace 级防护。请在本地或隔离环境运行。
+
+</details>
+
 ## 当前边界与路线
 
 已实现的是单机 Agent 执行内核和本地观测闭环。后续重点方向：
@@ -402,3 +517,25 @@ my-agent/
 6. Docker Compose 自托管部署与团队 Web 工作台。
 
 更多设计背景见 [`docs/`](docs/)。
+
+## 作者联系
+
+- **GitHub**: [uuforeverr](https://github.com/uuforeverr)
+
+## 项目统计
+
+| 项 | 值 |
+| --- | --- |
+| 仓库 | [uuforeverr/My-Agent](https://github.com/uuforeverr/My-Agent) |
+| 主要语言 | Python |
+| 运行依赖 | `lark-oapi`、`croniter`（CLI 核心走标准库） |
+
+## License
+
+本仓库暂未添加 `LICENSE` 文件，使用或二次分发前请先通过 Issue 与作者确认。欢迎补充标准开源协议。
+
+## Star History
+
+如果这个项目对你有帮助，欢迎点一个 Star ⭐
+
+[![Star History Chart](https://api.star-history.com/svg?repos=uuforeverr/My-Agent&type=Date)](https://star-history.com/#uuforeverr/My-Agent&Date)
