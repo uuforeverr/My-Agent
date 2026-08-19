@@ -41,3 +41,21 @@ def test_path_is_session_and_day_scoped(tmp_memory_dir: Path):
     path = store.append_message("default", "user", "x")
     assert path.parent.name == "default"
     assert path.suffix == ".jsonl"
+
+
+def test_read_session_concatenates_days(tmp_memory_dir: Path):
+    store = RawConversationStore(tmp_memory_dir)
+    session_dir = tmp_memory_dir / "raw" / "cli_local_cid"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "2026-07-05.jsonl").write_text(
+        '{"created_at":"2026-07-05T10:00:00","session_id":"cli:local:cid","role":"user","content":"day1"}\n',
+        encoding="utf-8",
+    )
+    (session_dir / "2026-07-06.jsonl").write_text(
+        '{"created_at":"2026-07-06T10:00:00","session_id":"cli:local:cid","role":"assistant","content":"day2"}\n',
+        encoding="utf-8",
+    )
+    records = store.read_session("cli:local:cid")
+    assert [item["content"] for item in records] == ["day1", "day2"]
+    grouped = store.read_all_sessions()
+    assert [item["content"] for item in grouped["cli:local:cid"]] == ["day1", "day2"]

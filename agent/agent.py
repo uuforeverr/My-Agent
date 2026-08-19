@@ -62,7 +62,41 @@ class Agent:
                     compactor=Compactor(lambda: self.llm, self.compaction_prompt),
                 )
                 self._context_managers[session_id] = manager
+                if not manager.history:
+                    manager.history = self._hydrate_history(session_id)
             return manager
+
+    def _hydrate_history(self, session_id: str) -> list[dict[str, Any]]:
+        records = self.memory.raw_store.read_session(session_id)
+        messages: list[dict[str, Any]] = []
+        for record in records:
+            message = self._raw_record_to_history_message(record)
+            if message is not None:
+                messages.append(message)
+        return messages
+
+    @staticmethod
+    def _raw_record_to_history_message(record: dict[str, Any]) -> Optional[dict[str, Any]]:
+        role = record.get("role")
+        if role not in {"user", "assistant", "tool"}:
+            return None
+        message: dict[str, Any] = {
+            "role": role,
+            "content": record.get("content") or "",
+        }
+        metadata = record.get("metadata") or {}
+        if role == "assistant":
+            tool_calls = metadata.get("tool_calls")
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+        elif role == "tool":
+            name = record.get("name") or metadata.get("name")
+            if name:
+                message["name"] = name
+            tool_call_id = metadata.get("tool_call_id")
+            if tool_call_id:
+                message["tool_call_id"] = tool_call_id
+        return message
 
     def run(
         self,

@@ -126,6 +126,44 @@ def test_memory_dream_runs_without_delivery_target():
     assert sent == []
 
 
+def test_memory_scan_episodic_runs_without_delivery_target():
+    captured = {}
+
+    def run_scan(keep_recent_turns=3, min_flush_turns=20):
+        captured["keep_recent_turns"] = keep_recent_turns
+        captured["min_flush_turns"] = min_flush_turns
+        return {"ok": True, "skipped": False}
+
+    sent = []
+    executor = SchedulerExecutor(
+        send_reply=lambda t, r: sent.append(r) or True,
+        run_scan=run_scan,
+    )
+    task = {
+        "id": "scan",
+        "action": {
+            "type": "memory_scan_episodic",
+            "keep_recent_turns": 3,
+            "min_flush_turns": 20,
+        },
+    }
+
+    assert executor.execute(task) is True
+    assert captured["keep_recent_turns"] == 3
+    assert captured["min_flush_turns"] == 20
+    assert sent == []
+
+
+def test_memory_scan_episodic_requires_runner():
+    executor = SchedulerExecutor(send_reply=lambda t, r: True)
+    task = {"id": "scan", "action": {"type": "memory_scan_episodic"}}
+    try:
+        executor.execute(task)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
 def test_memory_dream_requires_runner():
     executor = SchedulerExecutor(send_reply=lambda t, r: True)
     task = {"id": "dream", "action": {"type": "memory_dream"}}

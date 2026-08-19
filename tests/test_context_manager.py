@@ -1,5 +1,3 @@
-from concurrent.futures import Future
-
 from agent.compactor import Compactor, split_recent_turns
 from agent.context_manager import ContextManager
 from agent.run_context import RunContext
@@ -27,22 +25,6 @@ class FakeMemory:
 class FakeSkillLoader:
     def build_prompt(self):
         return "<available_skills></available_skills>", 0
-
-
-class FutureMemory(FakeMemory):
-    def __init__(self):
-        super().__init__()
-        self.future = Future()
-
-    def flush_from_messages(self, messages, reason, session_id, max_messages):
-        super().flush_from_messages(messages, reason, session_id, max_messages)
-        return {
-            "ok": True,
-            "skipped": False,
-            "async": True,
-            "reason": reason,
-            "future": self.future,
-        }
 
 
 def test_build_model_messages_injects_memory_and_skills(tmp_workspace):
@@ -166,10 +148,7 @@ def test_count_trigger_replaces_old_turns_with_summary(tmp_workspace):
     assert manager.history[-1]["content"] == "t-asst-2"
     assert manager.compact_count == 1
     assert manager.last_compact_reason == "count"
-    assert memory.flushed[0]["reason"] == "context_compact"
-    assert [m["content"] for m in memory.flushed[0]["messages"]] == [
-        "t-user-0", "t-asst-0", "t-user-1", "t-asst-1",
-    ]
+    assert memory.flushed == []
     assert llm.calls and llm.calls[0][0]["role"] == "system"
     compact_span = next(span for span in ctx.trace.spans if span.span_kind == "context.compact")
     assert compact_span.attributes["reason"] == "count"
@@ -187,7 +166,7 @@ def test_token_trigger_without_count_over(tmp_workspace):
     assert manager.last_compact_reason == "tokens"
     assert manager.history[0]["content"].startswith("<conversation_summary")
     assert "token-summary" in manager.history[0]["content"]
-    assert memory.flushed
+    assert memory.flushed == []
 
 
 def test_both_triggers_compact_once(tmp_workspace):
@@ -216,22 +195,16 @@ def test_neither_trigger_keeps_history(tmp_workspace):
 
 
 def test_compact_flush_records_async_result(tmp_workspace):
-    memory = FutureMemory()
+    memory = FakeMemory()
     manager = _manager(memory=memory, max_history=1, keep=1, window=100000)
     _add_turns(manager, 2)
     ctx = RunContext.create("session-x", tmp_workspace)
 
     manager.build_model_messages(ctx)
-    memory.future.set_result({
-        "ok": True,
-        "skipped": False,
-        "episodic_items": 1,
-        "reason": "context_compact",
-    })
 
-    event = ctx.trace.events[-1]
-    assert event["name"] == "memory_flush_completed"
-    assert event["episodic_items"] == 1
+    assert manager.compact_count == 1
+    assert memory.flushed == []
+    assert all(event["name"] != "memory_flush_completed" for event in ctx.trace.events)
 
 
 def test_compact_failure_keeps_history(tmp_workspace):

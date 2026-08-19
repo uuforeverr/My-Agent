@@ -11,11 +11,13 @@ WAITING_APPROVAL = "waiting_approval"
 #   run_agent(message, context) -> (answer, trace)   the Agent.run signature
 #   run_tool(name, arguments, context) -> ToolResult  the ToolRegistry.run signature
 #   run_dream(lookback_days) -> dict          run memory deep-dream consolidation
+#   run_scan(keep_recent_turns, min_flush_turns) -> dict
 #   build_context(session_id, **metadata) -> RunContext
 SendReply = Callable[[ChannelTarget, Reply], bool]
 RunAgent = Callable[..., Any]
 RunTool = Callable[..., Any]
 RunDream = Callable[..., Any]
+RunScan = Callable[..., Any]
 BuildContext = Callable[..., Any]
 
 
@@ -33,6 +35,7 @@ class SchedulerExecutor:
         run_agent: Optional[RunAgent] = None,
         run_tool: Optional[RunTool] = None,
         run_dream: Optional[RunDream] = None,
+        run_scan: Optional[RunScan] = None,
         build_context: Optional[BuildContext] = None,
         trace_store: Optional[JsonlTraceStore] = None,
     ):
@@ -40,6 +43,7 @@ class SchedulerExecutor:
         self.run_agent = run_agent
         self.run_tool = run_tool
         self.run_dream = run_dream
+        self.run_scan = run_scan
         self.build_context = build_context
         self.trace_store = trace_store
 
@@ -62,6 +66,8 @@ class SchedulerExecutor:
             ) as span:
                 if action_type == "memory_dream":
                     result = self._memory_dream(task, action, trace)
+                elif action_type == "memory_scan_episodic":
+                    result = self._memory_scan_episodic(task, action, trace)
                 else:
                     target = ChannelTarget.from_dict(action.get("target") or {})
                     if not target.channel_type:
@@ -119,6 +125,34 @@ class SchedulerExecutor:
             task_id=task.get("id"),
             lookback_days=lookback_days,
             ok=bool((result or {}).get("ok")) if isinstance(result, dict) else True,
+        )
+        return True
+
+    def _memory_scan_episodic(self, task: dict[str, Any], action: dict[str, Any], trace: Trace) -> bool:
+        if self.run_scan is None:
+            raise ValueError("memory_scan_episodic requires run_scan")
+
+        try:
+            keep_recent_turns = int(action.get("keep_recent_turns") or 3)
+            min_flush_turns = int(action.get("min_flush_turns") or 20)
+        except (TypeError, ValueError) as e:
+            raise ValueError("memory_scan_episodic keep_recent_turns/min_flush_turns must be integers") from e
+        if keep_recent_turns <= 0:
+            raise ValueError("memory_scan_episodic keep_recent_turns must be > 0")
+        if min_flush_turns < 0:
+            raise ValueError("memory_scan_episodic min_flush_turns must be >= 0")
+
+        result = self.run_scan(
+            keep_recent_turns=keep_recent_turns,
+            min_flush_turns=min_flush_turns,
+        )
+        trace.add(
+            "scheduler_memory_scan_completed",
+            task_id=task.get("id"),
+            keep_recent_turns=keep_recent_turns,
+            min_flush_turns=min_flush_turns,
+            ok=bool((result or {}).get("ok")) if isinstance(result, dict) else True,
+            skipped=bool((result or {}).get("skipped")) if isinstance(result, dict) else False,
         )
         return True
 

@@ -45,6 +45,8 @@ class Settings:
     tool_approval_mode: str = "off"
     model_context_window: Optional[int] = None
     keep_recent_turns: int = 3
+    episodic_scan_interval: int = 60
+    episodic_flush_min_turns: int = 20
 
 
 def _parse_channels(raw: str) -> tuple[str, ...]:
@@ -109,4 +111,6 @@ def load_settings() -> Settings:
         tool_approval_mode=_parse_approval_mode(os.environ.get("TOOL_APPROVAL_MODE", "off")),
         model_context_window=_parse_optional_positive_int(os.environ.get("MODEL_CONTEXT_WINDOW", "")),
         keep_recent_turns=max(1, int(os.environ.get("KEEP_RECENT_TURNS", "3"))),
+        episodic_scan_interval=max(0, int(os.environ.get("EPISODIC_SCAN_INTERVAL", "60"))),
+        episodic_flush_min_turns=max(0, int(os.environ.get("EPISODIC_FLUSH_MIN_TURNS", "20"))),
     )

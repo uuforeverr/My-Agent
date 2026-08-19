@@ -89,6 +89,8 @@ def settings_factory(tmp_path: Path):
             "tool_approval_mode": "off",
             "model_context_window": None,
             "keep_recent_turns": 3,
+            "episodic_scan_interval": 60,
+            "episodic_flush_min_turns": 20,
         }
         defaults.update(overrides)
         return Settings(**defaults)

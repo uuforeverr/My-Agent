@@ -45,6 +45,8 @@ def test_load_settings_defaults_and_casts(monkeypatch, tmp_path):
     monkeypatch.delenv("TOOL_APPROVAL_MODE", raising=False)
     monkeypatch.delenv("MODEL_CONTEXT_WINDOW", raising=False)
     monkeypatch.delenv("KEEP_RECENT_TURNS", raising=False)
+    monkeypatch.delenv("EPISODIC_SCAN_INTERVAL", raising=False)
+    monkeypatch.delenv("EPISODIC_FLUSH_MIN_TURNS", raising=False)
 
     settings = load_settings()
 
@@ -67,6 +69,8 @@ def test_load_settings_defaults_and_casts(monkeypatch, tmp_path):
     assert settings.tool_approval_mode == "off"
     assert settings.model_context_window is None
     assert settings.keep_recent_turns == 3
+    assert settings.episodic_scan_interval == 60
+    assert settings.episodic_flush_min_turns == 20
 
 
 def test_load_settings_tool_approval_mode(monkeypatch, tmp_path):
@@ -85,12 +89,16 @@ def test_load_settings_compaction_window_and_turns(monkeypatch, tmp_path):
     monkeypatch.setenv("WORKSPACE", str(tmp_path / "w"))
     monkeypatch.setenv("MODEL_CONTEXT_WINDOW", "1000")
     monkeypatch.setenv("KEEP_RECENT_TURNS", "5")
+    monkeypatch.setenv("EPISODIC_FLUSH_MIN_TURNS", "8")
     settings = load_settings()
     assert settings.model_context_window == 1000
     assert settings.keep_recent_turns == 5
+    assert settings.episodic_flush_min_turns == 8
 
     monkeypatch.setenv("MODEL_CONTEXT_WINDOW", "not-a-number")
     monkeypatch.setenv("KEEP_RECENT_TURNS", "0")
+    monkeypatch.setenv("EPISODIC_FLUSH_MIN_TURNS", "-1")
     settings = load_settings()
     assert settings.model_context_window is None
     assert settings.keep_recent_turns == 1
+    assert settings.episodic_flush_min_turns == 0

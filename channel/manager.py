@@ -16,6 +16,7 @@ from scheduler.schedule import calculate_next_run
 from scheduler.service import SchedulerService
 
 DAILY_DREAM_TASK_ID = "system_daily_dream"
+EPISODIC_SCAN_TASK_ID = "system_episodic_scan"
 RESTART_APPROVAL_MESSAGE = "进程重启，待审批已失效"
 
 
@@ -57,6 +58,7 @@ class ChannelManager:
         if store is None or self.scheduler_service is not None:
             return
         self._ensure_daily_dream_task(store)
+        self._ensure_episodic_scan_task(store)
         gate = getattr(getattr(self.agent, "tools", None), "approval_gate", None)
         if gate is not None:
             gate.on_scheduled_resolved = self._on_scheduled_resolved
@@ -67,6 +69,7 @@ class ChannelManager:
             run_agent=self.agent.run,
             run_tool=self.agent.tools.run,
             run_dream=self.agent.memory.deep_dream,
+            run_scan=getattr(self.agent.memory, "scan_raw_for_episodic", None),
             build_context=self._build_scheduler_context,
             trace_store=JsonlTraceStore.for_project(self.settings.project_root),
         )
@@ -112,6 +115,49 @@ class ChannelManager:
         task = {
             "id": DAILY_DREAM_TASK_ID,
             "name": "每日凌晨做梦",
+            "enabled": True,
+            "created_at": now.isoformat(timespec="seconds"),
+            "updated_at": now.isoformat(timespec="seconds"),
+            "schedule": schedule,
+            "action": action,
+            "next_run_at": next_run.isoformat(),
+            "last_run_at": None,
+            "last_error": None,
+            "last_error_at": None,
+        }
+        store.add(task)
+
+    def _ensure_episodic_scan_task(self, store) -> None:
+        interval = int(self.settings.episodic_scan_interval)
+        if interval <= 0:
+            return
+
+        now = datetime.now()
+        schedule = {"type": "interval", "seconds": interval}
+        next_run = calculate_next_run(schedule, from_time=now)
+        if next_run is None:
+            return
+
+        action = {
+            "type": "memory_scan_episodic",
+            "keep_recent_turns": self.settings.keep_recent_turns,
+            "min_flush_turns": self.settings.episodic_flush_min_turns,
+        }
+        existing = store.get(EPISODIC_SCAN_TASK_ID)
+        if existing is not None:
+            updates = {}
+            if existing.get("schedule") != schedule:
+                updates["schedule"] = schedule
+                updates["next_run_at"] = next_run.isoformat()
+            if existing.get("action") != action:
+                updates["action"] = action
+            if updates:
+                store.update(EPISODIC_SCAN_TASK_ID, updates)
+            return
+
+        task = {
+            "id": EPISODIC_SCAN_TASK_ID,
+            "name": "情景记忆水位扫描",
             "enabled": True,
             "created_at": now.isoformat(timespec="seconds"),
             "updated_at": now.isoformat(timespec="seconds"),

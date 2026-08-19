@@ -32,10 +32,40 @@ class RawConversationStore:
         return path
 
     def read_day(self, session_id: str, day: Optional[str] = None) -> list[dict[str, Any]]:
-        path = self._path_for(session_id, day=day)
+        return self._read_jsonl(self._path_for(session_id, day=day))
+
+    def read_session(self, session_id: str) -> list[dict[str, Any]]:
+        session_dir = self.raw_dir / self._safe_session_id(session_id)
+        records = self._read_session_dir(session_dir)
+        records.sort(key=lambda item: item.get("created_at") or "")
+        return records
+
+    def read_all_sessions(self) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        if not self.raw_dir.exists():
+            return grouped
+        for session_dir in self.raw_dir.iterdir():
+            if not session_dir.is_dir():
+                continue
+            records = self._read_session_dir(session_dir)
+            for record in records:
+                session_id = record.get("session_id") or session_dir.name
+                grouped.setdefault(session_id, []).append(record)
+        for records in grouped.values():
+            records.sort(key=lambda item: item.get("created_at") or "")
+        return grouped
+
+    def _read_session_dir(self, session_dir: Path) -> list[dict[str, Any]]:
+        if not session_dir.is_dir():
+            return []
+        records: list[dict[str, Any]] = []
+        for path in sorted(session_dir.glob("*.jsonl")):
+            records.extend(self._read_jsonl(path))
+        return records
+
+    def _read_jsonl(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
             return []
-
         records = []
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():

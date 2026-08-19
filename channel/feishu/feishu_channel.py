@@ -119,13 +119,30 @@ class FeishuChannel(ChatChannel):
         if not open_id:
             return
 
+        group_id = message.get("chat_id") if is_group else None
+        scope = group_id if is_group and group_id else open_id
+        if content.strip() == "/new":
+            self.start_new_conversation(scope)
+            incoming = IncomingMessage(
+                channel_type=self.channel_type,
+                user_id=open_id,
+                content=content,
+                msg_id=msg_id,
+                is_group=is_group,
+                group_id=group_id,
+                raw=event,
+            )
+            self.send(Reply("🌱 已开启新对话"), incoming)
+            return
+
         incoming = IncomingMessage(
             channel_type=self.channel_type,
             user_id=open_id,
             content=content,
             msg_id=msg_id,
             is_group=is_group,
-            group_id=message.get("chat_id") if is_group else None,
+            group_id=group_id,
+            conversation_id=self.current_conversation(scope),
             raw=event,
         )
         if content.strip() == "/summarize":

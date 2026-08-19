@@ -1,4 +1,5 @@
 from channel.cli.cli_channel import CONTINUE, PRODUCED, STOP, CLIChannel
+from channel.conversation import CONVERSATION_ID_PATTERN
 from channel.message import IncomingMessage
 from channel.reply import Reply
 from observability import Trace
@@ -134,7 +135,9 @@ def test_dispatch_summarize_does_not_produce(settings_factory, tmp_path, capsys)
     channel = _channel(settings_factory, tmp_path, agent=agent)
 
     assert channel._dispatch("/summarize") == CONTINUE
-    assert agent.calls == ["cli:local"]
+    assert len(agent.calls) == 1
+    assert agent.calls[0].startswith("cli:local:")
+    assert CONVERSATION_ID_PATTERN.match(agent.calls[0].split(":")[-1])
     assert agent.run_called is False
     assert channel.sessions == {}
     assert "已压缩" in capsys.readouterr().out
@@ -150,11 +153,15 @@ def test_dispatch_summarize_noop_message(settings_factory, tmp_path, capsys):
 def test_dispatch_normal_input_produces(settings_factory, tmp_path):
     channel = _channel(settings_factory, tmp_path)
     assert channel._dispatch("hello there") == PRODUCED
-    assert list(channel.sessions.keys()) == ["cli:local"]
-    queued = channel.sessions["cli:local"][0][0]
+    keys = list(channel.sessions.keys())
+    assert len(keys) == 1
+    assert keys[0].startswith("cli:local:")
+    assert CONVERSATION_ID_PATTERN.match(keys[0].split(":")[-1])
+    queued = channel.sessions[keys[0]][0][0]
     assert isinstance(queued, IncomingMessage)
     assert queued.content == "hello there"
     assert queued.channel_type == "cli"
+    assert queued.conversation_id == keys[0].split(":")[-1]
 
 
 class ApprovalAgent:

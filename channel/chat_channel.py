@@ -1,16 +1,21 @@
+import json
 import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 from typing import Optional
 
 from agent.agent import Agent
 from agent.run_context import RunContext
 from channel.base import Channel
+from channel.conversation import new_conversation_id
 from channel.message import IncomingMessage
 from channel.reply import Reply
 from config import Settings
 from observability import JsonlTraceStore, Trace
+
+_CONVERSATION_STATE_LOCK = threading.Lock()
 
 
 class ChatChannel(Channel):
@@ -40,6 +45,75 @@ class ChatChannel(Channel):
         self._consume_thread: Optional[threading.Thread] = None
         self.last_trace = None
         self.trace_store = JsonlTraceStore.for_project(settings.project_root)
+        self._conversations: dict[str, str] = {}
+        self._conv_lock = threading.Lock()
+        self._load_conversations()
+
+    def _conversation_state_path(self) -> Path:
+        return self.settings.project_root / "data" / "memory" / "conversation_state.json"
+
+    def _conversation_key(self, scope: str) -> str:
+        channel = getattr(self, "channel_type", None) or "chat"
+        return f"{channel}:{scope}"
+
+    def _load_conversations(self) -> None:
+        path = self._conversation_state_path()
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return
+        if isinstance(data, dict):
+            self._conversations = {
+                str(key): str(value) for key, value in data.items() if key and value
+            }
+
+    def _persist_conversations(self) -> None:
+        path = self._conversation_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _CONVERSATION_STATE_LOCK:
+            merged: dict[str, str] = {}
+            if path.exists():
+                try:
+                    loaded = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        merged.update(
+                            {
+                                str(key): str(value)
+                                for key, value in loaded.items()
+                                if key and value
+                            }
+                        )
+                except (OSError, json.JSONDecodeError, TypeError):
+                    pass
+            merged.update(self._conversations)
+            self._conversations = merged
+            path.write_text(
+                json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+    def current_conversation(self, scope: str) -> str:
+        key = self._conversation_key(scope)
+        with self._conv_lock:
+            cid = self._conversations.get(key)
+            if cid is None:
+                cid = new_conversation_id()
+                self._conversations[key] = cid
+                self._persist_conversations()
+            return cid
+
+    def start_new_conversation(self, scope: str) -> str:
+        key = self._conversation_key(scope)
+        with self._conv_lock:
+            previous = self._conversations.get(key)
+            cid = new_conversation_id()
+            while cid == previous:
+                cid = new_conversation_id()
+            self._conversations[key] = cid
+            self._persist_conversations()
+            return cid
 
     def produce(self, message: IncomingMessage) -> None:
         session_id = message.session_id

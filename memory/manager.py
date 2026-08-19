@@ -1,3 +1,4 @@
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -179,12 +180,125 @@ class MemoryManager:
             "insights": insights,
         }
 
+    def scan_raw_for_episodic(
+        self,
+        keep_recent_turns: int = 3,
+        min_flush_turns: int = 20,
+    ) -> dict[str, Any]:
+        if self._closed:
+            return {"ok": False, "skipped": True, "reason": "manager_closed", "sessions": []}
+        if self.curator.llm is None:
+            return {"ok": True, "skipped": True, "reason": "no_llm", "sessions": []}
+
+        keep = max(1, int(keep_recent_turns))
+        min_batch = max(0, int(min_flush_turns))
+        grouped = self.raw_store.read_all_sessions()
+        sessions: list[dict[str, Any]] = []
+        with self._episodic_lock:
+            watermarks = self._load_watermarks()
+            for session_id, records in grouped.items():
+                result = self._scan_session_locked(
+                    session_id,
+                    records,
+                    keep,
+                    min_batch,
+                    watermarks,
+                )
+                sessions.append(result)
+            self._save_watermarks(watermarks)
+        return {"ok": True, "skipped": False, "sessions": sessions}
+
     def close(self, wait: bool = True) -> None:
         if self._closed:
             return
         self._closed = True
         self._executor.shutdown(wait=wait)
         self.index.close()
+
+    def _scan_session_locked(
+        self,
+        session_id: str,
+        records: list[dict[str, Any]],
+        keep: int,
+        min_batch: int,
+        watermarks: dict[str, Any],
+    ) -> dict[str, Any]:
+        user_indices = [
+            index for index, record in enumerate(records) if record.get("role") == "user"
+        ]
+        total_turns = len(user_indices)
+        flushed = int((watermarks.get(session_id) or {}).get("flushed_user_turns") or 0)
+        pending = total_turns - flushed
+        threshold = keep + min_batch
+        if pending <= threshold:
+            return {
+                "session_id": session_id,
+                "skipped": True,
+                "reason": "below_flush_threshold",
+                "total_turns": total_turns,
+                "flushed_user_turns": flushed,
+                "threshold": threshold,
+            }
+
+        start_turn = flushed
+        end_turn = total_turns - keep
+        messages = self._extract_user_assistant_turns(records, user_indices, start_turn, end_turn)
+        flush_result = self._write_episodic_from_messages(
+            messages,
+            reason="raw_watermark",
+            session_id=session_id,
+            max_messages=0,
+        )
+        if flush_result.get("ok"):
+            watermarks[session_id] = {"flushed_user_turns": end_turn}
+            flushed = end_turn
+        return {
+            "session_id": session_id,
+            "skipped": False,
+            "ok": bool(flush_result.get("ok")),
+            "total_turns": total_turns,
+            "flushed_user_turns": flushed,
+            "extracted_turns": end_turn - start_turn,
+            "episodic_items": flush_result.get("episodic_items", 0),
+        }
+
+    @staticmethod
+    def _extract_user_assistant_turns(
+        records: list[dict[str, Any]],
+        user_indices: list[int],
+        start_turn: int,
+        end_turn: int,
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        for turn_index in range(start_turn, end_turn):
+            start = user_indices[turn_index]
+            stop = user_indices[turn_index + 1] if turn_index + 1 < len(user_indices) else len(records)
+            for record in records[start:stop]:
+                role = record.get("role")
+                if role not in {"user", "assistant"}:
+                    continue
+                messages.append({
+                    "role": role,
+                    "content": record.get("content") or "",
+                })
+        return messages
+
+    def _load_watermarks(self) -> dict[str, Any]:
+        path = self.memory_dir / "episodic_watermark.json"
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_watermarks(self, watermarks: dict[str, Any]) -> None:
+        path = self.memory_dir / "episodic_watermark.json"
+        path.write_text(
+            json.dumps(watermarks, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     def _flush_worker(
         self,
@@ -194,37 +308,51 @@ class MemoryManager:
         max_messages: int,
     ) -> dict[str, Any]:
         with self._episodic_lock:
-            try:
-                existing_daily = self.episodic_store.read_day()
-                summary = self.curator.summarize_daily(
-                    messages=messages,
-                    existing_daily_memory=existing_daily,
-                    session_id=session_id,
-                    reason=reason,
-                    max_messages=max_messages,
-                )
-                count = self.episodic_store.append_summary(
-                    summary,
-                    reason=reason,
-                    session_id=session_id,
-                )
-                if count:
-                    self._reindex_today_episodic()
-                result = {
-                    "ok": True,
-                    "skipped": count == 0,
-                    "episodic_items": count,
-                    "reason": reason,
-                }
-                if count == 0:
-                    result["skip_reason"] = "no_summary_items"
-                return result
-            except Exception as e:
-                return {
-                    "ok": False,
-                    "skipped": False,
-                    "error": f"{type(e).__name__}: {e}",
-                }
+            return self._write_episodic_from_messages(
+                messages,
+                reason=reason,
+                session_id=session_id,
+                max_messages=max_messages,
+            )
+
+    def _write_episodic_from_messages(
+        self,
+        messages: list[dict[str, Any]],
+        reason: str,
+        session_id: str,
+        max_messages: int,
+    ) -> dict[str, Any]:
+        try:
+            existing_daily = self.episodic_store.read_day()
+            summary = self.curator.summarize_daily(
+                messages=messages,
+                existing_daily_memory=existing_daily,
+                session_id=session_id,
+                reason=reason,
+                max_messages=max_messages,
+            )
+            count = self.episodic_store.append_summary(
+                summary,
+                reason=reason,
+                session_id=session_id,
+            )
+            if count:
+                self._reindex_today_episodic()
+            result = {
+                "ok": True,
+                "skipped": count == 0,
+                "episodic_items": count,
+                "reason": reason,
+            }
+            if count == 0:
+                result["skip_reason"] = "no_summary_items"
+            return result
+        except Exception as e:
+            return {
+                "ok": False,
+                "skipped": False,
+                "error": f"{type(e).__name__}: {e}",
+            }
 
     def _rebuild_episodic_index(self) -> None:
         with self._episodic_lock:

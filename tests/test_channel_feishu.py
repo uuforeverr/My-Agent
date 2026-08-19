@@ -3,9 +3,20 @@ import sys
 import time
 import types
 
+from channel.conversation import CONVERSATION_ID_PATTERN
 from channel.feishu.feishu_channel import FeishuChannel
 from channel.message import IncomingMessage
 from channel.reply import Reply
+
+
+def _only_session(channel, prefix: str) -> tuple[str, str]:
+    keys = list(channel.sessions.keys())
+    assert len(keys) == 1
+    key = keys[0]
+    assert key.startswith(prefix + ":"), key
+    cid = key[len(prefix) + 1 :]
+    assert CONVERSATION_ID_PATTERN.match(cid), cid
+    return key, cid
 
 
 def _channel(settings_factory, tmp_path):
@@ -55,12 +66,13 @@ def test_handle_p2p_text_event_produces_message(settings_factory, tmp_path):
     channel = _channel(settings_factory, tmp_path)
     channel._handle_message_event(_text_event(text="你好", open_id="ou_abc"))
 
-    assert list(channel.sessions.keys()) == ["feishu:ou_abc"]
-    msg = channel.sessions["feishu:ou_abc"][0][0]
+    session_id, cid = _only_session(channel, "feishu:ou_abc")
+    msg = channel.sessions[session_id][0][0]
     assert isinstance(msg, IncomingMessage)
     assert msg.user_id == "ou_abc"
     assert msg.content == "你好"
-    assert msg.session_id == "feishu:ou_abc"
+    assert msg.conversation_id == cid
+    assert msg.session_id == f"feishu:ou_abc:{cid}"
 
 
 def test_summarize_does_not_produce_or_run_agent(settings_factory, tmp_path):
@@ -80,7 +92,11 @@ def test_summarize_does_not_produce_or_run_agent(settings_factory, tmp_path):
     channel._handle_message_event(_text_event(text="/summarize", open_id="ou_abc"))
 
     assert channel.sessions == {}
-    assert sent == [("已压缩", "feishu:ou_abc")]
+    assert sent[0][0] == "已压缩"
+    session_id = sent[0][1]
+    assert session_id.startswith("feishu:ou_abc:")
+    assert CONVERSATION_ID_PATTERN.match(session_id.split(":")[-1])
+    assert channel.agent.session_id == session_id
 
 
 def test_approve_does_not_produce_or_run_agent(settings_factory, tmp_path):
@@ -109,7 +125,10 @@ def test_approve_does_not_produce_or_run_agent(settings_factory, tmp_path):
 
     assert channel.sessions == {}
     assert agent.calls == [("approve", "abcdef12", "ou_abc", "session")]
-    assert sent == [("已批准 [abcdef12]", "ou_abc", "feishu:ou_abc")]
+    assert sent[0][0] == "已批准 [abcdef12]"
+    assert sent[0][1] == "ou_abc"
+    assert sent[0][2].startswith("feishu:ou_abc:")
+    assert CONVERSATION_ID_PATTERN.match(sent[0][2].split(":")[-1])
 
 
 def test_group_other_user_cannot_approve(settings_factory, tmp_path):
@@ -168,7 +187,8 @@ def test_duplicate_msg_id_ignored(settings_factory, tmp_path):
     channel._handle_message_event(_text_event(msg_id="dup"))
     channel._handle_message_event(_text_event(msg_id="dup", text="second"))
 
-    assert len(channel.sessions["feishu:ou_1"][0]) == 1
+    session_id, _cid = _only_session(channel, "feishu:ou_1")
+    assert len(channel.sessions[session_id][0]) == 1
 
 
 def test_group_without_mention_ignored(settings_factory, tmp_path):
@@ -184,10 +204,11 @@ def test_group_with_mention_uses_chat_id_session(settings_factory, tmp_path):
         mentions=[{"key": "@_user_1"}],
         chat_id="oc_group",
     ))
-    assert list(channel.sessions.keys()) == ["feishu:oc_group"]
-    msg = channel.sessions["feishu:oc_group"][0][0]
+    session_id, cid = _only_session(channel, "feishu:oc_group")
+    msg = channel.sessions[session_id][0][0]
     assert msg.is_group is True
     assert msg.group_id == "oc_group"
+    assert msg.conversation_id == cid
 
 
 def test_group_mention_matches_bot_open_id(settings_factory, tmp_path):
@@ -198,7 +219,7 @@ def test_group_mention_matches_bot_open_id(settings_factory, tmp_path):
         mentions=[{"id": {"open_id": "ou_bot"}}],
         chat_id="oc_group",
     ))
-    assert list(channel.sessions.keys()) == ["feishu:oc_group"]
+    _only_session(channel, "feishu:oc_group")
 
 
 def test_group_mention_of_someone_else_ignored(settings_factory, tmp_path):
@@ -223,7 +244,7 @@ def test_group_mention_without_bot_open_id_falls_back(settings_factory, tmp_path
         chat_id="oc_group",
     ))
     # Fallback: any mention counts as the bot so we don't go silent.
-    assert list(channel.sessions.keys()) == ["feishu:oc_group"]
+    _only_session(channel, "feishu:oc_group")
 
 
 def test_fetch_bot_open_id_parses_response(settings_factory, tmp_path, monkeypatch):

@@ -150,7 +150,6 @@ class ContextManager:
             self.compact_count = next_count
             self.last_compact_reason = reason
             self.history = [build_summary_message(summary, next_count, raw_path)] + recent
-            self._flush_discarded(to_compact, run_context, reason="context_compact")
             span.set_attributes(
                 history_after=len(self.history),
                 tokens_after=self.token_counter.count_payload(

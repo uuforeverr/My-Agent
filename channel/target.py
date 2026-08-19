@@ -2,6 +2,7 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
+from channel.conversation import conversation_id_from_session_id
 from channel.message import IncomingMessage
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ class ChannelTarget:
             msg_id=f"scheduler:{uuid.uuid4().hex}",
             is_group=self.is_group,
             group_id=self.group_id,
+            conversation_id=conversation_id_from_session_id(self.session_id),
         )
 
     def to_dict(self) -> dict[str, Any]:

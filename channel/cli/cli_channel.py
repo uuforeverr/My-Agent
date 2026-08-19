@@ -56,10 +56,15 @@ class CLIChannel(ChatChannel):
             else:
                 print(f"dream skipped: {result.get('reason', 'unknown')}")
             return CONTINUE
+        if line == "/new":
+            cid = self.start_new_conversation(self.user_id)
+            print(f"🌱 new conversation: {cid}")
+            return CONTINUE
         if line == "/summarize":
             summarize = getattr(self.agent, "summarize_session", None)
             if callable(summarize):
-                print(summarize("cli:local"))
+                cid = self.current_conversation(self.user_id)
+                print(summarize(f"{self.channel_type}:{self.user_id}:{cid}"))
             else:
                 print("无需压缩")
             return CONTINUE
@@ -84,6 +89,7 @@ class CLIChannel(ChatChannel):
             user_id=self.user_id,
             content=line,
             msg_id=uuid.uuid4().hex,
+            conversation_id=self.current_conversation(self.user_id),
         ))
         return PRODUCED
 
