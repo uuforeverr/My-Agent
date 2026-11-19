@@ -6,7 +6,7 @@ from channel.chat_channel import ChatChannel
 from channel.cli.cli_channel import CLIChannel
 from channel.factory import create_channel
 from channel.feishu.feishu_channel import FeishuChannel
-from channel.manager import DAILY_DREAM_TASK_ID, EPISODIC_SCAN_TASK_ID, ChannelManager
+from channel.manager import DAILY_DREAM_TASK_ID, LEGACY_EPISODIC_SCAN_TASK_ID, ChannelManager
 from channel.message import IncomingMessage
 from channel.reply import Reply
 from channel.target import ChannelTarget
@@ -243,7 +243,6 @@ def test_start_scheduler_creates_daily_dream_task(settings_factory, tmp_path):
     settings = settings_factory(
         workspace=tmp_path / "w",
         daily_dream_cron="0 0 * * *",
-        daily_dream_lookback_days=2,
     )
     store = TaskStore(tmp_path / "scheduler" / "tasks.json")
     manager = ChannelManager(settings, agent=_FakeAgent(scheduler_store=store))
@@ -253,34 +252,31 @@ def test_start_scheduler_creates_daily_dream_task(settings_factory, tmp_path):
         assert task is not None
         assert task["name"] == "每日凌晨做梦"
         assert task["schedule"] == {"type": "cron", "expression": "0 0 * * *"}
-        assert task["action"] == {"type": "memory_dream", "lookback_days": 2}
+        assert task["action"] == {"type": "memory_dream"}
         assert task["next_run_at"] is not None
     finally:
         manager.shutdown()
 
 
-def test_start_scheduler_creates_episodic_scan_task(settings_factory, tmp_path):
+def test_start_scheduler_removes_legacy_episodic_scan_task(settings_factory, tmp_path):
     from scheduler.task_store import TaskStore
 
-    settings = settings_factory(
-        workspace=tmp_path / "w",
-        episodic_scan_interval=60,
-        keep_recent_turns=3,
-    )
+    settings = settings_factory(workspace=tmp_path / "w")
     store = TaskStore(tmp_path / "scheduler" / "tasks.json")
+    store.add({
+        "id": LEGACY_EPISODIC_SCAN_TASK_ID,
+        "name": "legacy scan",
+        "enabled": True,
+        "created_at": "2026-01-01T00:00:00",
+        "updated_at": "2026-01-01T00:00:00",
+        "schedule": {"type": "interval", "seconds": 60},
+        "action": {"type": "memory_scan_episodic"},
+        "next_run_at": "2026-01-01T00:01:00",
+    })
     manager = ChannelManager(settings, agent=_FakeAgent(scheduler_store=store))
     try:
         manager.start_scheduler()
-        scan = store.get(EPISODIC_SCAN_TASK_ID)
-        assert scan is not None
-        assert scan["name"] == "情景记忆水位扫描"
-        assert scan["schedule"] == {"type": "interval", "seconds": 60}
-        assert scan["action"] == {
-            "type": "memory_scan_episodic",
-            "keep_recent_turns": 3,
-            "min_flush_turns": 20,
-        }
-        assert scan["next_run_at"] is not None
+        assert store.get(LEGACY_EPISODIC_SCAN_TASK_ID) is None
     finally:
         manager.shutdown()
 

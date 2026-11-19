@@ -1,10 +1,11 @@
-import json
 import uuid
+from typing import Any
 
 from channel.chat_channel import ChatChannel
+from channel.delivery import DeliveryReceipt
 from channel.message import IncomingMessage
 from channel.reply import Reply
-from observability import TraceQuery, format_trace_tree, summarize_trace_record
+from observability.otel import add_content_event, add_event, current_context, get_tracer, set_attributes
 from tools.approval import handle_approval_command
 
 STOP = "stop"
@@ -12,15 +13,125 @@ CONTINUE = "continue"
 PRODUCED = "produced"
 
 
+class _CLIStreamHandle:
+    """Write visible Responses deltas immediately and avoid a duplicate final answer."""
+
+    def __init__(self):
+        self._parts: list[str] = []
+        self._started = False
+        self._last_delta_type = ""
+        self._needs_separator = False
+        self._delta_count = 0
+        self._parent_context = current_context()
+        self._span = None
+
+    def _ensure_span(self, source: str):
+        if self._span is not None:
+            return self._span
+        self._span = get_tracer().start_span(
+            "send_response cli",
+            context=self._parent_context,
+        )
+        set_attributes(
+            self._span,
+            **{
+                "messaging.system": "cli",
+                "my_agent.channel.delivery_mode": "direct_delta",
+                "my_agent.channel.first_output_source": source,
+            },
+        )
+        return self._span
+
+    def publish(self, event: dict[str, Any]) -> bool:
+        event_type = str(event.get("type") or "")
+        if event_type == "assistant_progress":
+            # The same model-authored pre-tool text has already arrived through
+            # output_text deltas. Consume the summary event without printing it
+            # a second time, and separate the next model response visually.
+            self._needs_separator = True
+            return True
+        if event_type not in {"assistant_delta", "assistant_progress_delta"}:
+            return False
+        content = str(event.get("content") or "")
+        if not content:
+            return True
+        span = self._ensure_span(event_type)
+        if self._delta_count == 0:
+            add_event(
+                span,
+                "my_agent.channel.first_chunk_buffered",
+                {
+                    "my_agent.channel.chunk_type": event_type,
+                    "my_agent.channel.chunk_chars": len(content),
+                },
+            )
+        if not self._started:
+            print()
+            self._started = True
+        elif self._needs_separator or (
+            self._last_delta_type and self._last_delta_type != event_type
+        ):
+            print()
+        print(content, end="", flush=True)
+        self._parts.append(content)
+        self._last_delta_type = event_type
+        self._needs_separator = False
+        self._delta_count += 1
+        return True
+
+    def complete(self, final_text: str, timeout: float = 15.0) -> DeliveryReceipt:
+        del timeout
+        span = self._ensure_span("final_response")
+        emitted = "".join(self._parts)
+        if not self._started:
+            print(f"\n{final_text or ''}")
+        elif final_text and not emitted.endswith(final_text):
+            # Compatibility fallback for providers that stop emitting deltas
+            # before the completed response body. Prefer a complete answer even
+            # if that means printing it on a new line.
+            print(f"\n{final_text}")
+        else:
+            print()
+        add_event(
+            span,
+            "my_agent.channel.final_chunk_buffered",
+            {"my_agent.channel.final_chars": len(final_text or "")},
+        )
+        add_event(
+            span,
+            "my_agent.channel.flush",
+            {
+                "final": True,
+                "chars": len(final_text or ""),
+                "delivered": True,
+                "status": "delivered",
+                "my_agent.channel.delivery_mode": "direct_delta",
+                "my_agent.channel.delta_count": self._delta_count,
+            },
+        )
+        add_content_event(span, "my_agent.channel.final_content", final_text or "")
+        set_attributes(
+            span,
+            **{
+                "my_agent.channel.delivered": True,
+                "my_agent.channel.final_chars": len(final_text or ""),
+                "my_agent.channel.delta_count": self._delta_count,
+            },
+        )
+        span.end()
+        return DeliveryReceipt.success()
+
+
 class CLIChannel(ChatChannel):
     channel_type = "cli"
     user_id = "local"
+    deliver_assistant_progress = False
 
     def startup(self) -> None:  # pragma: no cover - interactive stdin loop, excluded from offline tests
         self.start_consuming()
         print("my-agent CLI")
         print(f"workspace: {self.settings.workspace}")
-        print("Type 'exit' to quit. '/trace' shows latest trace. '/traces' lists persisted traces.")
+        print("Type 'exit' to quit.")
         while True:
             try:
                 line = input("\n> ").strip()
@@ -35,20 +146,6 @@ class CLIChannel(ChatChannel):
             return CONTINUE
         if line.lower() in {"exit", "quit"}:
             return STOP
-        if line == "/trace":
-            if self.last_trace is None:
-                print("No trace yet.")
-            else:
-                print(self.last_trace.to_json(pretty=True))
-            return CONTINUE
-        if line.startswith("/trace "):
-            trace_id = line.split(maxsplit=1)[1].strip()
-            self._print_persisted_trace(trace_id)
-            return CONTINUE
-        if line == "/traces" or line.startswith("/traces "):
-            query = self._parse_traces_args(line)
-            self._print_trace_list(query=query)
-            return CONTINUE
         if line == "/dream":
             result = self.agent.memory.deep_dream(lookback_days=1)
             if result.get("ok"):
@@ -93,71 +190,13 @@ class CLIChannel(ChatChannel):
         ))
         return PRODUCED
 
-    def send(self, reply: Reply, message: IncomingMessage) -> None:
+    def send(self, reply: Reply, message: IncomingMessage) -> DeliveryReceipt:
         print(f"\n{reply.content}")
+        return DeliveryReceipt.success()
 
-    def _print_persisted_trace(self, trace_id: str) -> None:
-        record = self.trace_store.get(trace_id)
-        if record is None:
-            print(f"Trace not found: {trace_id}")
-            return
-        summary = summarize_trace_record(record)
-        print(
-            f"trace {summary['trace_id']} "
-            f"status={summary['status']} total_ms={summary['total_ms']} "
-            f"spans={summary['span_count']}"
-        )
-        print("\nspan tree:")
-        print(format_trace_tree(record))
-        print("\nraw:")
-        print(json.dumps(record, ensure_ascii=False, indent=2))
-
-    def _print_trace_list(self, query: TraceQuery = None) -> None:
-        query = query or TraceQuery()
-        records = self.trace_store.query_records(query)
-        if not records:
-            print("No persisted traces yet.")
-            return
-        print("created_at           status   total_ms   spans  trace_id                              root")
-        for record in records:
-            summary = summarize_trace_record(record)
-            trace_id = summary["trace_id"]
-            short_id = trace_id[:36]
-            total_ms = summary["total_ms"]
-            total_text = "-" if total_ms is None else str(total_ms)
-            print(
-                f"{summary['created_at'][:19]:19} "
-                f"{summary['status'][:7]:7} "
-                f"{total_text:>8} "
-                f"{str(summary['span_count']):>5}  "
-                f"{short_id:36} "
-                f"{summary['root_name']}"
-            )
-
-    @staticmethod
-    def _parse_traces_args(line: str) -> TraceQuery:
-        limit = 10
-        filters = {
-            "before": None,
-            "status": None,
-            "session_id": None,
-            "entrypoint": None,
-            "start": None,
-            "end": None,
-        }
-        for part in line.split()[1:]:
-            if "=" in part:
-                key, value = part.split("=", 1)
-                if key in filters:
-                    filters[key] = value.strip() or None
-                continue
-            try:
-                parsed = int(part)
-            except ValueError:
-                continue
-            if parsed > 0:
-                limit = parsed
-        return TraceQuery(limit=limit, **filters)
+    def _open_stream(self, message: IncomingMessage) -> _CLIStreamHandle:
+        del message
+        return _CLIStreamHandle()
 
     @staticmethod
     def _parse_sop_days(line: str, default: int = 3) -> int:

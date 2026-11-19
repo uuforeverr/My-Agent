@@ -1,0 +1,38 @@
+name: my-agent-observability
+
+services:
+  jaeger-volume-init:
+    image: alpine:3.22
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p /badger/data && chown -R 10001:10001 /badger"]
+    volumes:
+      - jaeger-badger:/badger
+    restart: "no"
+
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0
+    user: "10001:10001"
+    command: ["--config=/etc/jaeger/config.yaml"]
+    depends_on:
+      jaeger-volume-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./deploy/observability/jaeger.yaml:/etc/jaeger/config.yaml:ro
+      - jaeger-badger:/badger
+    ports:
+      - "127.0.0.1:16686:16686"
+    restart: unless-stopped
+
+  otel-collector:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.161.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    depends_on:
+      - jaeger
+    volumes:
+      - ./deploy/observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:4318:4318"
+    restart: unless-stopped
+
+volumes:
+  jaeger-badger:

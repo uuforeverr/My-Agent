@@ -74,7 +74,7 @@ def test_interval_advances_next_run(tmp_path):
     updated = store.get(task["id"])
     assert updated is not None
     next_run = datetime.fromisoformat(updated["next_run_at"])
-    assert next_run == now + timedelta(seconds=3600)
+    assert next_run == datetime.fromisoformat(due) + timedelta(seconds=3600)
     assert updated["last_run_at"] is not None
 
 
@@ -122,7 +122,7 @@ def test_missing_next_run_is_computed_not_executed(tmp_path):
     assert updated["next_run_at"] is not None
 
 
-def test_expired_once_beyond_catchup_is_deleted(tmp_path):
+def test_stale_once_executes_latest_occurrence_once(tmp_path):
     store = _store(tmp_path)
     now = datetime(2026, 1, 1, 12, 0, 0)
     stale = (now - timedelta(hours=2)).isoformat()
@@ -130,13 +130,13 @@ def test_expired_once_beyond_catchup_is_deleted(tmp_path):
     store.add(task)
 
     fired = []
-    service = SchedulerService(store, catchup_seconds=600, execute_callback=lambda t: fired.append(t) or True)
+    service = SchedulerService(store, execute_callback=lambda t: fired.append(t) or True)
     service.check_and_execute(now=now)
-    assert fired == []
+    assert len(fired) == 1
     assert store.get(task["id"]) is None
 
 
-def test_expired_interval_beyond_catchup_is_rescheduled(tmp_path):
+def test_stale_interval_executes_only_latest_occurrence(tmp_path):
     store = _store(tmp_path)
     now = datetime(2026, 1, 1, 12, 0, 0)
     stale = (now - timedelta(hours=2)).isoformat()
@@ -144,9 +144,10 @@ def test_expired_interval_beyond_catchup_is_rescheduled(tmp_path):
     store.add(task)
 
     fired = []
-    service = SchedulerService(store, catchup_seconds=600, execute_callback=lambda t: fired.append(t) or True)
+    service = SchedulerService(store, execute_callback=lambda t: fired.append(t) or True)
     service.check_and_execute(now=now)
-    assert fired == []
+    assert len(fired) == 1
+    assert fired[0]["next_run_at"] == now.isoformat()
     updated = store.get(task["id"])
     next_run = datetime.fromisoformat(updated["next_run_at"])
     assert next_run == now + timedelta(seconds=3600)

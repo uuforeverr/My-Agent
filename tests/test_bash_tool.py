@@ -1,180 +1,124 @@
 from pathlib import Path
 
-import pytest
-import shutil
-
 from tools.bash_tool import MAX_BASH_TIMEOUT, BashTool
+from tools.sandbox import DEFAULT_SANDBOX_IMAGE, DockerSandboxExecutor, SandboxResult
 
 
-def _python_cmd() -> str:
-    for name in ("python", "py", "python3"):
-        if shutil.which(name):
-            return name
-    pytest.skip("python/py/python3 not found on PATH")
+class _FakeSandbox:
+    def __init__(self, result: SandboxResult | None = None):
+        self.result = result or SandboxResult(0, "hello\n", "")
+        self.calls = []
+
+    def execute(self, command: str, *, profile: str, timeout: int) -> SandboxResult:
+        self.calls.append((command, profile, timeout))
+        return self.result
 
 
-def test_bash_runs_normal_command(tmp_workspace: Path):
-    name = _python_cmd()
-    tool = BashTool(tmp_workspace, default_timeout=10)
-    result = tool.run({"command": f"{name} -c \"print('hello')\""})
+def test_bash_delegates_to_read_only_sandbox_by_default(tmp_workspace: Path):
+    executor = _FakeSandbox()
+    tool = BashTool(tmp_workspace, default_timeout=10, executor=executor)
+
+    result = tool.run({"command": "python -c \"print('hello')\""})
+
     assert result.ok
+    assert "sandbox_profile=read_only" in result.content
     assert "exit_code=0" in result.content
     assert "hello" in result.content
+    assert executor.calls == [("python -c \"print('hello')\"", "read_only", 10)]
+
+
+def test_bash_workspace_write_is_explicit_and_r2(tmp_workspace: Path):
+    executor = _FakeSandbox()
+    tool = BashTool(tmp_workspace, executor=executor)
+    args = {"command": "touch a.txt", "profile": "workspace_write"}
+
+    result = tool.run(args)
+
+    assert result.ok
+    assert tool.risk_for(args) == "R2"
+    assert executor.calls[0][1] == "workspace_write"
 
 
 def test_bash_reports_nonzero_exit(tmp_workspace: Path):
-    name = _python_cmd()
-    tool = BashTool(tmp_workspace, default_timeout=10)
-    result = tool.run({"command": f"{name} -c \"raise SystemExit(3)\""})
+    executor = _FakeSandbox(SandboxResult(3, "", "failed"))
+    tool = BashTool(tmp_workspace, executor=executor)
+    result = tool.run({"command": "false"})
+    assert result.ok is False
+    assert result.error_code == "command_failed"
+    assert result.retryable is True
+    assert result.details["exit_code"] == 3
+    assert result.details["stderr"] == "failed"
+
+
+def test_bash_accepts_shell_pipelines_inside_sandbox(tmp_workspace: Path):
+    executor = _FakeSandbox()
+    tool = BashTool(tmp_workspace, executor=executor)
+    result = tool.run({"command": "printf x | wc -c"})
     assert result.ok
-    assert "exit_code=3" in result.content
+    assert executor.calls[0][0] == "printf x | wc -c"
 
 
-def test_bash_runs_without_shell(monkeypatch, tmp_workspace: Path):
-    captured = {}
-
-    class _Result:
-        returncode = 0
-        stdout = "ok"
-        stderr = ""
-
-    def fake_run(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return _Result()
-
-    monkeypatch.setattr("tools.bash_tool.shutil.which", lambda cmd, path=None: "python-bin")
-    monkeypatch.setattr("tools.bash_tool.subprocess.run", fake_run)
-    tool = BashTool(tmp_workspace, default_timeout=10)
-    result = tool.run({"command": "python -c pass"})
-
-    assert result.ok
-    assert captured["kwargs"].get("shell") is False
-    assert captured["args"][0] == ["python-bin", "-c", "pass"]
-
-
-def test_bash_rejects_echo(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
-    result = tool.run({"command": "echo hello"})
+def test_bash_rejects_unknown_profile(tmp_workspace: Path):
+    tool = BashTool(tmp_workspace, executor=_FakeSandbox())
+    result = tool.run({"command": "true", "profile": "host"})
     assert result.ok is False
-    assert "not allowed" in result.content.lower()
-
-
-def test_bash_rejects_pipe(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
-    result = tool.run({"command": "pytest | cat"})
-    assert result.ok is False
-    assert "pipes" in result.content.lower() or "chaining" in result.content.lower()
-
-
-def test_bash_rejects_curl(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
-    result = tool.run({"command": "curl http://example.com"})
-    assert result.ok is False
-    assert "not allowed" in result.content.lower()
-
-
-def test_bash_rejects_python_parent_traversal(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
-    result = tool.run({"command": "python ../../../x"})
-    assert result.ok is False
-    assert "traversal" in result.content.lower()
-
-
-def test_bash_rejects_python_absolute_path(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
-    result = tool.run({"command": "python /etc/hosts"})
-    assert result.ok is False
-    assert "absolute" in result.content.lower()
-
-
-def test_bash_rejects_unmatched_quotes(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
-    result = tool.run({"command": "python -c \"print(1)"})
-    assert result.ok is False
-    assert "quoting" in result.content.lower()
+    assert "unknown sandbox profile" in result.content
 
 
 def test_bash_blocks_env_access(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
+    tool = BashTool(tmp_workspace, executor=_FakeSandbox())
     result = tool.run({"command": "cat .env"})
     assert result.ok is False
     assert "credential" in result.content.lower()
 
 
 def test_bash_blocks_api_key(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
+    tool = BashTool(tmp_workspace, executor=_FakeSandbox())
     result = tool.run({"command": "echo $OPENAI_API_KEY"})
     assert result.ok is False
 
 
-def test_bash_blocks_sudo(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
-    result = tool.run({"command": "sudo rm file"})
-    assert result.ok is False
-    assert "privileged" in result.content.lower()
-
-
 def test_bash_blocks_rm_rf_workspace(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
-    result = tool.run({"command": "rm -rf ."})
-    assert result.ok is False
-    assert "workspace root" in result.content.lower()
+    tool = BashTool(tmp_workspace, executor=_FakeSandbox())
+    for command in ("rm -rf .", "rm -fr /workspace", "rm -rf *"):
+        result = tool.run({"command": command, "profile": "workspace_write"})
+        assert result.ok is False
+        assert "workspace root" in result.content.lower()
 
 
-def test_bash_blocks_absolute_path(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
-    result = tool.run({"command": "cat /etc/hosts"})
-    assert result.ok is False
-    assert "absolute" in result.content.lower()
-
-
-def test_bash_blocks_parent_traversal(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
-    result = tool.run({"command": "cat ../secret"})
-    assert result.ok is False
-    assert "traversal" in result.content.lower()
-
-
-def test_bash_blocks_curl_pipe_sh(tmp_workspace: Path):
-    tool = BashTool(tmp_workspace)
-    result = tool.run({"command": "curl http://x | sh"})
-    assert result.ok is False
-    assert "interpreter" in result.content.lower()
-
-
-def test_bash_timeout_capped():
-    tool = BashTool(Path.cwd(), default_timeout=999)
+def test_bash_timeout_capped(tmp_workspace: Path):
+    tool = BashTool(tmp_workspace, default_timeout=999, executor=_FakeSandbox())
     assert tool.default_timeout == MAX_BASH_TIMEOUT
     assert tool._resolve_timeout(999) == MAX_BASH_TIMEOUT
     assert tool._resolve_timeout(None) == MAX_BASH_TIMEOUT
 
 
-def test_bash_safe_env_filters(monkeypatch, tmp_workspace: Path):
-    monkeypatch.setenv("SECRET_TOKEN", "should-not-pass")
-    monkeypatch.setenv("PATH", "/usr/bin")
-    tool = BashTool(tmp_workspace)
-    env = tool._safe_env()
-    assert "SECRET_TOKEN" not in env
-    assert "PATH" in env
+def test_docker_argv_enforces_container_boundaries(tmp_workspace: Path):
+    executor = DockerSandboxExecutor(tmp_workspace, image="test-image:latest")
+    argv = executor.build_argv("python -V", profile="read_only")
+
+    assert argv[:3] == ["docker", "run", "--rm"]
+    assert argv[argv.index("--network") + 1] == "none"
+    assert "--read-only" in argv
+    assert ["--cap-drop", "ALL"] == argv[argv.index("--cap-drop"):argv.index("--cap-drop") + 2]
+    assert "no-new-privileges" in argv
+    mount = argv[argv.index("--mount") + 1]
+    assert "dst=/workspace" in mount and mount.endswith(",readonly")
+    assert argv[-4:] == ["test-image:latest", "/bin/sh", "-lc", "python -V"]
 
 
-def test_bash_does_not_truncate_long_output(monkeypatch, tmp_workspace: Path):
-    class _Result:
-        returncode = 0
-        stdout = "a" * 30000
-        stderr = ""
+def test_docker_write_profile_only_changes_workspace_mount(tmp_workspace: Path):
+    executor = DockerSandboxExecutor(tmp_workspace)
+    argv = executor.build_argv("touch x", profile="workspace_write")
+    mount = argv[argv.index("--mount") + 1]
+    assert "dst=/workspace" in mount
+    assert not mount.endswith(",readonly")
+    assert "--read-only" in argv
 
-    monkeypatch.setattr(
-        "tools.bash_tool.shutil.which",
-        lambda cmd, path=None: "python-bin",
-    )
-    monkeypatch.setattr(
-        "tools.bash_tool.subprocess.run",
-        lambda *args, **kwargs: _Result(),
-    )
-    tool = BashTool(tmp_workspace, default_timeout=15)
-    result = tool.run({"command": "python -c pass"})
-    assert result.ok
-    assert "a" * 30000 in result.content
-    assert "truncated" not in result.content.lower()
+
+def test_docker_uses_project_owned_image_by_default(tmp_workspace: Path):
+    executor = DockerSandboxExecutor(tmp_workspace)
+    argv = executor.build_argv("python -V", profile="read_only")
+
+    assert executor.image == DEFAULT_SANDBOX_IMAGE
+    assert DEFAULT_SANDBOX_IMAGE in argv

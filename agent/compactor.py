@@ -49,12 +49,18 @@ class Compactor:
         messages: list[dict[str, Any]],
         compact_count: int,
         raw_path: str,
+        previous_summary: str = "",
     ) -> str:
         payload = [
             {"role": "system", "content": self.prompt},
             {
                 "role": "user",
-                "content": self._render_user_prompt(messages, compact_count, raw_path),
+                "content": self._render_user_prompt(
+                    messages,
+                    compact_count,
+                    raw_path,
+                    previous_summary=previous_summary,
+                ),
             },
         ]
         reply = self._client().chat(payload)
@@ -68,11 +74,18 @@ class Compactor:
         messages: list[dict[str, Any]],
         compact_count: int,
         raw_path: str,
+        previous_summary: str = "",
     ) -> str:
         rendered = json.dumps(messages, ensure_ascii=False, default=str)
+        previous = str(previous_summary or "").strip() or "none"
         return (
             f"compact_count={compact_count}\n"
             f"transcript_path={raw_path}\n\n"
-            "Compress the following older conversation turns into a short working summary.\n\n"
+            "Merge the previous working summary and all older completed turns below "
+            "into one concise working summary. The current turn is intentionally absent "
+            "and must not be invented.\n\n"
+            f"<previous_working_summary>\n{previous}\n</previous_working_summary>\n\n"
+            "<older_completed_turns>\n"
             f"{rendered}"
+            "\n</older_completed_turns>"
         )

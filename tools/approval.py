@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from tools.policy import ToolRequest
+from tools.policy import ToolRequest, normalize_risk_level
 
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_SCHEDULED_TIMEOUT_SECONDS = 24 * 3600
@@ -111,7 +111,14 @@ class ApprovalGate:
             pending, error = self._validate_actor_locked(approval_id, user_id)
             if error:
                 return False, error
-            resolved_scope = "session" if str(scope).strip().lower() == "session" else "once"
+            requested_scope = "session" if str(scope).strip().lower() == "session" else "once"
+            # Every R2 approval is bound to one exact invocation. Approval must
+            # never become a broad capability grant for a high-risk tool.
+            resolved_scope = (
+                "once"
+                if normalize_risk_level(pending.request.risk_level) == "R2"
+                else requested_scope
+            )
             pending.status = "approved"
             pending.scope = resolved_scope
             pending.approver_user_id = user_id
@@ -161,6 +168,17 @@ class ApprovalGate:
             pending is not None
             and pending.status == "approved"
             and pending.request.name == tool_name
+        )
+
+    def allows_resume_request(self, approval_id: str, request: ToolRequest) -> bool:
+        pending = self.get(approval_id)
+        return (
+            pending is not None
+            and pending.status == "approved"
+            and pending.request.name == request.name
+            and pending.request.arguments == request.arguments
+            and pending.request.session_id == request.session_id
+            and pending.request.user_id == request.user_id
         )
 
     def attach_resume_state(
@@ -287,6 +305,9 @@ def format_approval_prompt(
 ) -> str:
     timeout_text = _format_timeout(timeout_seconds)
     argument_lines = format_argument_lines(request.arguments)
+    scope_line = ""
+    if normalize_risk_level(request.risk_level) != "R2":
+        scope_line = f"/approve {approval_id} session  本会话允许同类工具\n"
     return (
         f"待审批 [{approval_id}]\n"
         f"工具: {request.name}    等级: {request.risk_level}\n"
@@ -294,7 +315,7 @@ def format_approval_prompt(
         f"{argument_lines}\n"
         f"\n"
         f"/approve {approval_id}          仅本次\n"
-        f"/approve {approval_id} session  本会话允许同类工具\n"
+        f"{scope_line}"
         f"/deny {approval_id}             拒绝\n"
         f"超时 {timeout_text} 将自动拒绝。"
     )

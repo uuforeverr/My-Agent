@@ -1,9 +1,7 @@
-import json
 from pathlib import Path
 
 from agent.run_context import RunContext
 from channel.target import ChannelTarget
-from observability import JsonlTraceStore
 from scheduler.executor import SchedulerExecutor
 from tools.base import ToolResult
 
@@ -194,96 +192,27 @@ def test_unknown_action_type_raises():
         pass
 
 
-def test_executor_persists_send_message_trace(tmp_path):
-    trace_path = tmp_path / "traces.jsonl"
-    executor = SchedulerExecutor(
-        send_reply=lambda t, r: True,
-        trace_store=JsonlTraceStore(trace_path),
-    )
+def test_run_to_result_returns_scheduled_message_without_legacy_trace_store():
+    executor = SchedulerExecutor(send_reply=lambda t, r: True)
     task = {
-        "id": "t1",
-        "action": {"type": "send_message", "content": "该喝水了", "target": _target_dict()},
+        "id": "task-correlated",
+        "name": "correlated task",
+        "timing_semantics": "notify_at",
+        "next_run_at": "2026-10-14T13:00:00",
+        "action": {
+            "type": "send_message",
+            "content": "hello",
+            "target": _target_dict(session="cli:local:conversation"),
+        },
     }
 
-    assert executor.execute(task) is True
-
-    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
-    assert len(records) == 1
-    assert records[0]["status"] == "success"
-    assert records[0]["root_span_id"] == records[0]["spans"][0]["span_id"]
-    assert records[0]["spans"][0]["span_kind"] == "scheduler.execute"
-    assert records[0]["spans"][0]["attributes"]["delivered"] is True
-    assert [event["name"] for event in records[0]["events"]] == [
-        "scheduler_execute_start",
-        "scheduler_execute_completed",
-    ]
-    assert records[0]["events"][0]["task_id"] == "t1"
-
-
-def test_executor_persists_error_trace(tmp_path):
-    trace_path = tmp_path / "traces.jsonl"
-    executor = SchedulerExecutor(
-        send_reply=lambda t, r: True,
-        trace_store=JsonlTraceStore(trace_path),
+    result = executor.run_to_result(
+        task,
+        run_id="run-correlated",
+        run_kind="scheduled",
+        scheduled_for="2026-10-14T13:00:00",
+        deliver_at="2026-10-14T13:00:00",
     )
-    task = {"id": "x", "action": {"type": "explode", "target": _target_dict()}}
 
-    try:
-        executor.execute(task)
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
-
-    record = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[0])
-    assert record["status"] == "error"
-    assert record["error"]["type"] == "ValueError"
-    assert record["spans"][0]["span_kind"] == "scheduler.execute"
-    assert record["spans"][0]["status"] == "error"
-    assert record["events"][-1]["name"] == "scheduler_execute_error"
-
-
-def test_agent_task_reuses_scheduler_trace():
-    captured = {}
-
-    def run_agent(message, context=None):
-        captured["trace"] = context.trace
-        context.trace.add("agent_inner_event")
-        return "done", context.trace
-
-    executor = SchedulerExecutor(
-        send_reply=lambda t, r: True,
-        run_agent=run_agent,
-        build_context=_build_context,
-    )
-    task = {
-        "id": "abcd",
-        "action": {"type": "agent_task", "ai_task": "summarize", "target": _target_dict()},
-    }
-
-    assert executor.execute(task) is True
-    assert captured["trace"].events[1]["name"] == "agent_inner_event"
-
-
-def test_agent_task_span_is_child_of_scheduler_span():
-    captured = {}
-
-    def run_agent(message, context=None):
-        captured["trace"] = context.trace
-        with context.trace.start_span("agent.invoke", span_kind="agent.invoke") as span:
-            captured["agent_span_id"] = span.span_id
-            captured["agent_parent_span_id"] = span.parent_span_id
-        return "done", context.trace
-
-    executor = SchedulerExecutor(
-        send_reply=lambda t, r: True,
-        run_agent=run_agent,
-        build_context=_build_context,
-    )
-    task = {
-        "id": "abcd",
-        "action": {"type": "agent_task", "ai_task": "summarize", "target": _target_dict()},
-    }
-
-    assert executor.execute(task) is True
-    scheduler_span = next(span for span in captured["trace"].spans if span.span_kind == "scheduler.execute")
-    assert captured["agent_parent_span_id"] == scheduler_span.span_id
+    assert result.succeeded
+    assert result.content == "hello"

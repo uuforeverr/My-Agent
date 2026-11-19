@@ -1,25 +1,21 @@
-from agent.compactor import Compactor, split_recent_turns
+from agent.compactor import split_recent_turns
 from agent.context_manager import ContextManager
 from agent.run_context import RunContext
 from agent.token_counter import TokenCounter
-from tests.conftest import FakeLLM
 
 
 class FakeMemory:
     def __init__(self):
-        self.flushed = []
+        self.pending = []
+        self.build_calls = 0
 
     def build_prompt(self, query, limit=5):
+        self.build_calls += 1
         return f"MEMORY for {query}", 1
 
-    def flush_from_messages(self, messages, reason, session_id, max_messages):
-        self.flushed.append({
-            "messages": messages,
-            "reason": reason,
-            "session_id": session_id,
-            "max_messages": max_messages,
-        })
-        return {"ok": True, "async": True, "future": object()}
+    def enqueue_pending_messages(self, session_id, messages, user_id="local"):
+        self.pending.append((session_id, list(messages), user_id))
+        return 1
 
 
 class FakeSkillLoader:
@@ -27,7 +23,48 @@ class FakeSkillLoader:
         return "<available_skills></available_skills>", 0
 
 
-def test_build_model_messages_injects_memory_and_skills(tmp_workspace):
+class FakeCompactor:
+    def __init__(self, summary="task summary"):
+        self.summary = summary
+        self.calls = []
+
+    def summarize(
+        self,
+        messages,
+        compact_count,
+        raw_path,
+        previous_summary="",
+    ):
+        self.calls.append({
+            "messages": list(messages),
+            "compact_count": compact_count,
+            "raw_path": raw_path,
+            "previous_summary": previous_summary,
+        })
+        return self.summary
+
+
+def _counter(window=100000):
+    return TokenCounter(model="fake-model", window_override=window)
+
+
+def _manager(memory=None, window_turns=2, token_window=100000, compactor=None):
+    return ContextManager(
+        "IDENTITY",
+        memory=memory,
+        session_window_turns=window_turns,
+        token_counter=_counter(token_window),
+        compactor=compactor or FakeCompactor(),
+    )
+
+
+def _add_turns(manager, count, prefix="t"):
+    for index in range(count):
+        manager.append_user_message(f"{prefix}-user-{index}", turn_seq=index + 1)
+        manager.append_assistant_message({"role": "assistant", "content": f"{prefix}-asst-{index}"})
+
+
+def test_build_model_messages_injects_memory_and_skills(tmp_workspace, otel_exporter):
     memory = FakeMemory()
     manager = ContextManager("IDENTITY", memory=memory, skill_loader=FakeSkillLoader())
     manager.append_user_message("当前问题")
@@ -36,85 +73,28 @@ def test_build_model_messages_injects_memory_and_skills(tmp_workspace):
     messages = manager.build_model_messages(ctx)
 
     assert messages[0]["role"] == "system"
-    system_content = messages[0]["content"]
-    assert "IDENTITY" in system_content
-    assert "Current date:" in system_content
-    assert f"Workspace: {tmp_workspace.resolve()}" in system_content
-    assert "Session ID: s" in system_content
-    assert "MEMORY for 当前问题" in system_content
-    assert "<available_skills>" in system_content
+    assert "IDENTITY" in messages[0]["content"]
+    assert "MEMORY for 当前问题" in messages[0]["content"]
+    assert "<available_skills>" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "当前问题"}
-    event = ctx.trace.events[-1]
-    assert event["name"] == "context_built"
-    assert event["runtime_injected"] is True
-    assert event["memory_count"] == 1
-    assert event["skill_catalog_injected"] is True
-    span_kinds = [span.span_kind for span in ctx.trace.spans]
-    assert span_kinds == [
-        "context.build",
-        "memory.inject",
-        "skill.catalog.load",
-        "skill.catalog.inject",
-    ]
-    context_span = ctx.trace.spans[0]
-    assert all(span.parent_span_id == context_span.span_id for span in ctx.trace.spans[1:])
 
 
-def test_build_model_messages_injects_runtime_metadata(tmp_workspace):
+def test_internal_turn_sequence_is_not_sent_to_model(tmp_workspace):
     manager = ContextManager("IDENTITY")
-    manager.append_user_message("hello")
-    ctx = RunContext.create(
-        "cli:local",
-        tmp_workspace,
-        entrypoint="cli",
-        channel_type="cli",
-        user_id="local",
-        is_group=False,
-    )
-
-    messages = manager.build_model_messages(ctx)
-
-    system_content = messages[0]["content"]
-    assert "entrypoint: cli" in system_content
-    assert "channel_type: cli" in system_content
-    assert "user_id: local" in system_content
-    assert "is_group: False" in system_content
+    manager.append_user_message("hello", turn_seq=9)
+    messages = manager.build_model_messages(RunContext.create("s", tmp_workspace))
+    assert messages[1] == {"role": "user", "content": "hello"}
+    assert manager.history[0]["_turn_seq"] == 9
 
 
-def test_latest_user_message_returns_last_user():
-    manager = ContextManager("IDENTITY")
-    history = [
-        {"role": "user", "content": "first"},
-        {"role": "assistant", "content": "answer"},
-        {"role": "user", "content": "second"},
-    ]
-    assert manager._latest_user_message(history) == "second"
-    assert manager._latest_user_message([]) == ""
-
-
-def _counter(window=100000):
-    return TokenCounter(model="fake-model", window_override=window)
-
-
-def _manager(memory=None, max_history=2, keep=1, window=100000, llm="SUMMARY", **kwargs):
-    if isinstance(llm, str):
-        llm = FakeLLM(llm)
-    return ContextManager(
-        "IDENTITY",
-        max_history_messages=max_history,
-        memory=memory,
-        keep_recent_turns=keep,
-        token_counter=_counter(window),
-        compactor=Compactor(llm, "compact prompt") if llm is not None else None,
-        memory_flush_messages=kwargs.pop("memory_flush_messages", 9),
-        **kwargs,
-    )
-
-
-def _add_turns(manager, count, prefix="t"):
-    for index in range(count):
-        manager.append_user_message(f"{prefix}-user-{index}")
-        manager.append_assistant_message({"role": "assistant", "content": f"{prefix}-asst-{index}"})
+def test_memory_snapshot_is_reused_within_one_agent_run(tmp_workspace):
+    memory = FakeMemory()
+    manager = ContextManager("IDENTITY", memory=memory)
+    manager.append_user_message("只检索一次")
+    ctx = RunContext.create("s", tmp_workspace, user_id="alice")
+    manager.build_model_messages(ctx)
+    manager.build_model_messages(ctx)
+    assert memory.build_calls == 1
 
 
 def test_split_recent_turns_keeps_tool_pair_with_assistant():
@@ -125,158 +105,99 @@ def test_split_recent_turns_keeps_tool_pair_with_assistant():
         {"role": "user", "content": "new"},
         {"role": "assistant", "content": "done"},
     ]
-    to_compact, recent = split_recent_turns(history, keep_recent_turns=1)
-    assert to_compact[0]["content"] == "old"
-    assert to_compact[1]["tool_calls"][0]["id"] == "c1"
-    assert to_compact[2]["role"] == "tool"
-    assert [m.get("content") for m in recent] == ["new", "done"]
+    evicted, recent = split_recent_turns(history, keep_recent_turns=1)
+    assert [item["role"] for item in evicted] == ["user", "assistant", "tool"]
+    assert [item.get("content") for item in recent] == ["new", "done"]
 
 
-def test_count_trigger_replaces_old_turns_with_summary(tmp_workspace):
+def test_turn_window_evicts_only_complete_old_turns_to_pending(tmp_workspace):
     memory = FakeMemory()
-    llm = FakeLLM("goals: none")
-    manager = _manager(memory=memory, max_history=3, keep=1, window=100000, llm=llm)
+    manager = _manager(memory=memory, window_turns=2)
     _add_turns(manager, 3)
-    ctx = RunContext.create("session-x", tmp_workspace)
 
-    messages = manager.build_model_messages(ctx)
+    manager.build_model_messages(RunContext.create("session-x", tmp_workspace))
 
-    assert manager.history[0]["role"] == "user"
-    assert "<conversation_summary compact_count=\"1\">" in manager.history[0]["content"]
-    assert "goals: none" in manager.history[0]["content"]
-    assert "data/memory/raw/session-x/" in manager.history[0]["content"]
-    assert manager.history[-1]["content"] == "t-asst-2"
-    assert manager.compact_count == 1
-    assert manager.last_compact_reason == "count"
-    assert memory.flushed == []
-    assert llm.calls and llm.calls[0][0]["role"] == "system"
-    compact_span = next(span for span in ctx.trace.spans if span.span_kind == "context.compact")
-    assert compact_span.attributes["reason"] == "count"
-    assert messages[0]["role"] == "system"
+    assert [item["content"] for item in manager.history if item["role"] == "user"] == [
+        "t-user-1",
+        "t-user-2",
+    ]
+    assert memory.pending[0][0] == "session-x"
+    assert [item["content"] for item in memory.pending[0][1]] == ["t-user-0", "t-asst-0"]
+    assert manager.last_eviction_reason == "turn_window"
+    assert manager.compact_count == 0
 
 
-def test_token_trigger_without_count_over(tmp_workspace):
+def test_token_budget_summarizes_every_turn_before_latest(tmp_workspace):
     memory = FakeMemory()
-    manager = _manager(memory=memory, max_history=40, keep=1, window=80, llm="token-summary")
-    _add_turns(manager, 2)
-    ctx = RunContext.create("s", tmp_workspace)
+    compactor = FakeCompactor("goals, progress, blockers")
+    manager = _manager(
+        memory=memory,
+        window_turns=20,
+        token_window=80,
+        compactor=compactor,
+    )
+    _add_turns(manager, 3, prefix="long-" + ("x" * 100))
 
-    manager.build_model_messages(ctx)
+    messages = manager.build_model_messages(RunContext.create("s", tmp_workspace))
 
     assert manager.last_compact_reason == "tokens"
-    assert manager.history[0]["content"].startswith("<conversation_summary")
-    assert "token-summary" in manager.history[0]["content"]
-    assert memory.flushed == []
-
-
-def test_both_triggers_compact_once(tmp_workspace):
-    manager = _manager(max_history=2, keep=1, window=80, llm="both")
-    _add_turns(manager, 3)
-    ctx = RunContext.create("s", tmp_workspace)
-
-    manager.build_model_messages(ctx)
-
     assert manager.compact_count == 1
-    assert manager.last_compact_reason == "count"
-
-
-def test_neither_trigger_keeps_history(tmp_workspace):
-    memory = FakeMemory()
-    manager = _manager(memory=memory, max_history=40, keep=3, window=100000, llm="should-not-run")
-    manager.append_user_message("hello")
-    ctx = RunContext.create("s", tmp_workspace)
-
-    manager.build_model_messages(ctx)
-
-    assert manager.history == [{"role": "user", "content": "hello"}]
-    assert manager.compact_count == 0
-    assert memory.flushed == []
-    assert all(span.span_kind != "context.compact" for span in ctx.trace.spans)
-
-
-def test_compact_flush_records_async_result(tmp_workspace):
-    memory = FakeMemory()
-    manager = _manager(memory=memory, max_history=1, keep=1, window=100000)
-    _add_turns(manager, 2)
-    ctx = RunContext.create("session-x", tmp_workspace)
-
-    manager.build_model_messages(ctx)
-
-    assert manager.compact_count == 1
-    assert memory.flushed == []
-    assert all(event["name"] != "memory_flush_completed" for event in ctx.trace.events)
-
-
-def test_compact_failure_keeps_history(tmp_workspace):
-    class BoomLLM:
-        def chat(self, messages, tools=None):
-            raise RuntimeError("boom")
-
-    memory = FakeMemory()
-    original = [
-        {"role": "user", "content": "u0"},
-        {"role": "assistant", "content": "a0"},
-        {"role": "user", "content": "u1"},
-        {"role": "assistant", "content": "a1"},
+    assert [item["content"] for item in manager.history] == [
+        "long-" + ("x" * 100) + "-user-2",
+        "long-" + ("x" * 100) + "-asst-2",
     ]
-    manager = _manager(memory=memory, max_history=2, keep=1, window=100000, llm=BoomLLM())
-    manager.history = list(original)
-    ctx = RunContext.create("s", tmp_workspace)
+    assert len(compactor.calls[0]["messages"]) == 4
+    assert memory.pending
+    assert "goals, progress, blockers" in messages[0]["content"]
+    assert "<conversation_summary" in messages[0]["content"]
 
-    manager.build_model_messages(ctx)
 
-    assert manager.history == original
+def test_single_oversized_turn_is_kept(tmp_workspace):
+    manager = _manager(window_turns=20, token_window=50)
+    manager.append_user_message("read it", turn_seq=1)
+    manager.append_assistant_message({"role": "assistant", "content": "word " * 4000})
+
+    manager.build_model_messages(RunContext.create("s", tmp_workspace))
+
     assert manager.compact_count == 0
-    assert memory.flushed == []
-    compact_span = next(span for span in ctx.trace.spans if span.span_kind == "context.compact")
-    assert compact_span.status == "error"
+    assert manager.history[-1]["content"].startswith("word")
 
 
-def test_empty_summary_keeps_history(tmp_workspace):
-    manager = _manager(max_history=2, keep=1, window=100000, llm=FakeLLM({"role": "assistant", "content": ""}))
+def test_manual_compact_moves_old_turns_to_pending(tmp_workspace):
+    memory = FakeMemory()
+    manager = _manager(memory=memory, window_turns=20)
     _add_turns(manager, 2)
-    original = list(manager.history)
-    ctx = RunContext.create("s", tmp_workspace)
 
-    manager.build_model_messages(ctx)
-
-    assert manager.history == original
-    assert manager.compact_count == 0
+    assert manager.compact_now(RunContext.create("s", tmp_workspace)) is True
+    assert [item["content"] for item in manager.history] == ["t-user-1", "t-asst-1"]
+    assert memory.pending
 
 
-def test_token_over_in_recent_turns_keeps_history(tmp_workspace):
-    manager = _manager(max_history=40, keep=3, window=50, llm="unused")
-    huge = "word " * 4000
-    manager.append_user_message("read it")
-    manager.append_assistant_message({
-        "role": "assistant",
-        "content": "",
-        "tool_calls": [{"id": "c1", "function": {"name": "bash"}}],
-    })
-    manager.append_tool_result("c1", "bash", huge)
-    ctx = RunContext.create("s", tmp_workspace)
+def test_compaction_failure_keeps_exact_history(tmp_workspace):
+    class BrokenCompactor:
+        def summarize(self, *args, **kwargs):
+            raise RuntimeError("summary failed")
 
-    manager.build_model_messages(ctx)
-
-    assert manager.compact_count == 0
-    assert manager.history[-1]["content"] == huge
-    assert "[truncated:" not in manager.history[-1]["content"]
-
-
-def test_manual_compact_without_old_turns_is_noop(tmp_workspace):
-    manager = _manager(max_history=40, keep=3, window=100000)
-    manager.append_user_message("only")
-    ctx = RunContext.create("s", tmp_workspace)
-
-    assert manager.compact_now(ctx) is False
-    assert manager.compact_count == 0
-
-
-def test_manual_compact_ignores_thresholds(tmp_workspace):
-    manager = _manager(max_history=40, keep=1, window=100000, llm="manual-summary")
+    manager = _manager(compactor=BrokenCompactor())
     _add_turns(manager, 2)
-    ctx = RunContext.create("cli:local", tmp_workspace)
+    before = list(manager.history)
 
-    assert manager.compact_now(ctx) is True
-    assert manager.last_compact_reason == "manual"
-    assert "manual-summary" in manager.history[0]["content"]
+    assert manager.compact_now(RunContext.create("s", tmp_workspace)) is False
+    assert manager.history == before
+    assert manager.working_summary == ""
+
+
+def test_active_turn_does_not_consume_completed_turn_window(tmp_workspace):
+    memory = FakeMemory()
+    manager = _manager(memory=memory, window_turns=2)
+    _add_turns(manager, 2)
+    manager.append_user_message("current", turn_seq=3)
+
+    manager.build_model_messages(RunContext.create("s", tmp_workspace))
+
+    assert [item["content"] for item in manager.history if item["role"] == "user"] == [
+        "t-user-0",
+        "t-user-1",
+        "current",
+    ]
+    assert memory.pending == []

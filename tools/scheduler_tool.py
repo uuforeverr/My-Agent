@@ -4,12 +4,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from channel.target import ChannelTarget
+from observability.correlation import scheduler_correlation_attributes
 from scheduler.schedule import ScheduleError, calculate_next_run, parse_schedule
-from scheduler.task_store import TaskStore
+from scheduler.repository import SchedulerRepository
 from tools.base import BaseTool, ToolError, ToolResult
 from agent.run_context import RunContext
 
 VALID_ACTIONS = ("create", "list", "get", "delete", "enable", "disable")
+VALID_TIMING_SEMANTICS = ("notify_at", "start_at", "deliver_by")
 
 
 class SchedulerTool(BaseTool):
@@ -64,21 +66,42 @@ class SchedulerTool(BaseTool):
                     "interval: integer seconds. cron: a 5-field cron expression like '0 9 * * *'."
                 ),
             },
+            "timing_semantics": {
+                "type": "string",
+                "enum": list(VALID_TIMING_SEMANTICS),
+                "description": (
+                    "notify_at sends a fixed reminder at the time; start_at begins work at the time; "
+                    "deliver_by prepares early and releases the result at the time."
+                ),
+            },
+            "min_lead_seconds": {
+                "type": "number",
+                "description": "Minimum preparation lead time for deliver_by (default 30 seconds).",
+            },
+            "max_lead_seconds": {
+                "type": "number",
+                "description": "Maximum preparation lead time for deliver_by (default 3600 seconds).",
+            },
         },
         "required": ["action"],
     }
-    risk_level = "L2"
+    risk_level = "R2"
     idempotent = False
 
-    def __init__(self, workspace: Path, store: TaskStore):
+    def __init__(self, workspace: Path, store: SchedulerRepository):
         super().__init__(workspace)
         self.store = store
+        self.control: Optional[Any] = None
+
+    def bind_control(self, control: Any) -> None:
+        """Bind the live scheduler after ChannelManager has constructed it."""
+        self.control = control
 
     def risk_for(self, arguments: dict[str, Any]) -> str:
         action = str((arguments or {}).get("action", "")).strip()
         if action in ("list", "get"):
-            return "L0"
-        return "L2"
+            return "R0"
+        return "R2"
 
     def run(
         self,
@@ -86,26 +109,50 @@ class SchedulerTool(BaseTool):
         context: Optional[RunContext] = None,
     ) -> ToolResult:
         try:
-            return ToolResult(ok=True, content=self._dispatch(arguments, context))
+            content, metadata = self._dispatch(arguments, context)
+            return ToolResult(ok=True, content=content, metadata=metadata)
         except (ToolError, ScheduleError) as e:
             return ToolResult(ok=False, content=str(e))
         except Exception as e:
             return ToolResult(ok=False, content=f"{type(e).__name__}: {e}")
 
-    def _dispatch(self, arguments: dict[str, Any], context: Optional[RunContext]) -> str:
+    def _dispatch(
+        self,
+        arguments: dict[str, Any],
+        context: Optional[RunContext],
+    ) -> tuple[str, dict[str, Any]]:
         action = str(arguments.get("action", "")).strip()
         if action not in VALID_ACTIONS:
             raise ToolError(f"action must be one of {VALID_ACTIONS}, got {action!r}")
 
         if action == "create":
-            return self._create(arguments, context)
+            content = self._create(arguments, context)
+            payload = json.loads(content)
+            task = self.store.get(str(payload.get("task_id") or "")) or {}
+            validation = payload.get("validation") or {}
+            run = {
+                "id": validation.get("run_id"),
+                "run_kind": "validation" if validation.get("run_id") else None,
+            }
+            return content, scheduler_correlation_attributes(
+                operation="scheduler.create",
+                task=task,
+                run=run,
+            )
         if action == "list":
-            return self._list()
+            return self._list(), scheduler_correlation_attributes(operation="scheduler.list")
+        task_id = self._require_task_id(arguments)
         if action == "get":
-            return self._get(arguments)
+            content = self._get(arguments)
+            task = self.store.get(task_id) or {"id": task_id}
+            return content, scheduler_correlation_attributes(operation="scheduler.get", task=task)
         if action == "delete":
-            return self._delete(arguments)
-        return self._set_enabled(arguments, enabled=(action == "enable"))
+            task = self.store.get(task_id) or {"id": task_id}
+            content = self._delete(arguments)
+            return content, scheduler_correlation_attributes(operation="scheduler.delete", task=task)
+        content = self._set_enabled(arguments, enabled=(action == "enable"))
+        task = self.store.get(task_id) or {"id": task_id}
+        return content, scheduler_correlation_attributes(operation=f"scheduler.{action}", task=task)
 
     def _create(self, arguments: dict[str, Any], context: Optional[RunContext]) -> str:
         if context is None:
@@ -126,26 +173,56 @@ class SchedulerTool(BaseTool):
             raise ToolError("schedule produces no future run time")
 
         task_id = self.store.new_task_id()
+        timing_semantics = str(arguments.get("timing_semantics") or "").strip()
+        if not timing_semantics:
+            timing_semantics = "notify_at" if action["type"] == "send_message" else "start_at"
+        if timing_semantics not in VALID_TIMING_SEMANTICS:
+            raise ToolError(f"timing_semantics must be one of {VALID_TIMING_SEMANTICS}")
+        min_lead = self._lead_bound(arguments, "min_lead_seconds", 30.0)
+        max_lead = self._lead_bound(arguments, "max_lead_seconds", 3600.0)
+        if min_lead > max_lead:
+            raise ToolError("min_lead_seconds must be <= max_lead_seconds")
+        validating = self.control is not None
         task = {
             "id": task_id,
             "name": str(arguments.get("name") or "").strip() or f"task-{task_id}",
-            "enabled": True,
+            "enabled": not validating,
+            "status": "validating" if validating else "enabled",
             "created_at": now.isoformat(timespec="seconds"),
             "updated_at": now.isoformat(timespec="seconds"),
             "schedule": schedule,
             "action": action,
+            "timing_semantics": timing_semantics,
+            "min_lead_seconds": min_lead,
+            "max_lead_seconds": max_lead,
             "next_run_at": next_run.isoformat(),
             "last_run_at": None,
             "last_error": None,
             "last_error_at": None,
         }
         self.store.add(task)
+        validation = None
+        if validating:
+            try:
+                validation = self.control.validate_task(task_id)
+            except Exception as exc:
+                self.store.update(
+                    task_id,
+                    {
+                        "status": "validation_failed",
+                        "last_error": f"{type(exc).__name__}: {exc}",
+                        "last_error_at": datetime.now().isoformat(timespec="seconds"),
+                    },
+                )
+                raise ToolError(f"task saved but validation could not start: {exc}") from exc
         return json.dumps(
             {
                 "ok": True,
                 "task_id": task_id,
                 "name": task["name"],
                 "next_run_at": task["next_run_at"],
+                "timing_semantics": timing_semantics,
+                "validation": validation,
             },
             ensure_ascii=False,
         )
@@ -195,6 +272,8 @@ class SchedulerTool(BaseTool):
 
     def _delete(self, arguments: dict[str, Any]) -> str:
         task_id = self._require_task_id(arguments)
+        if self.control is not None:
+            self.control.remove_task(task_id)
         if not self.store.delete(task_id):
             raise ToolError(f"unknown task: {task_id}")
         return json.dumps({"ok": True, "deleted": task_id}, ensure_ascii=False)
@@ -204,7 +283,23 @@ class SchedulerTool(BaseTool):
         if self.store.get(task_id) is None:
             raise ToolError(f"unknown task: {task_id}")
         self.store.set_enabled(task_id, enabled)
+        if self.control is not None:
+            if enabled:
+                self.control.sync_task(task_id)
+            else:
+                self.control.remove_task(task_id)
         return json.dumps({"ok": True, "task_id": task_id, "enabled": enabled}, ensure_ascii=False)
+
+    @staticmethod
+    def _lead_bound(arguments: dict[str, Any], key: str, default: float) -> float:
+        raw = arguments.get(key, default)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ToolError(f"{key} must be a number") from exc
+        if value < 0:
+            raise ToolError(f"{key} must be >= 0")
+        return value
 
     @staticmethod
     def _require_task_id(arguments: dict[str, Any]) -> str:

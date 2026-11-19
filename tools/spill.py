@@ -51,12 +51,14 @@ def maybe_spill(
             content=format_truncated_preview(counter, content, token_count, write_error),
             waiting_approval=result.waiting_approval,
             approval_id=result.approval_id,
+            metadata=dict(result.metadata),
         )
     return ToolResult(
         ok=True,
         content=format_spilled_preview(counter, content, token_count, rel_path),
         waiting_approval=result.waiting_approval,
         approval_id=result.approval_id,
+        metadata=dict(result.metadata),
     )
 
 

@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from tools.base import BaseTool, ToolError, ToolResult
+from observability.otel import set_attributes, set_error, start_span
 
 L1_DIFF_PREVIEW_LINES = 40
 
@@ -28,7 +29,7 @@ class GlobTool(BaseTool):
         },
         "required": ["pattern"],
     }
-    risk_level = "L0"
+    risk_level = "R0"
     idempotent = True
 
     def execute(self, arguments: dict[str, Any]) -> str:
@@ -51,7 +52,7 @@ class GlobTool(BaseTool):
         lines = []
         for path in matches:
             suffix = "/" if path.is_dir() else ""
-            lines.append(f"{path.relative_to(self.workspace)}{suffix}")
+            lines.append(f"{path.relative_to(self.workspace).as_posix()}{suffix}")
         return "\n".join(lines)
 
     def _validate_pattern(self, pattern: str) -> None:
@@ -84,31 +85,34 @@ class ReadFileTool(BaseTool):
         },
         "required": ["path"],
     }
-    risk_level = "L0"
+    risk_level = "R0"
     idempotent = True
 
     def run(self, arguments: dict[str, Any], context: Any = None) -> ToolResult:
         target = self._skill_activation_target(arguments)
-        trace = getattr(context, "trace", None)
-        if target is None or trace is None:
+        if target is None:
             return super().run(arguments, context)
 
         skill_name, rel_path = target
-        with trace.start_span(
+        with start_span(
             "skill.activate",
-            span_kind="skill.activate",
-            session_id=getattr(context, "session_id", ""),
-            skill_name=skill_name,
-            file_path=str(rel_path),
-            activation_source=self.name,
+            attributes={
+                "my_agent.session.id": getattr(context, "session_id", ""),
+                "my_agent.skill.name": skill_name,
+                "my_agent.file.path": str(rel_path),
+                "my_agent.skill.activation_source": self.name,
+            },
         ) as span:
             result = super().run(arguments, context)
-            span.set_attributes(
-                ok=result.ok,
-                result_chars=len(result.content or ""),
+            set_attributes(
+                span,
+                **{
+                    "my_agent.tool.ok": result.ok,
+                    "my_agent.tool.result_chars": len(result.content or ""),
+                },
             )
             if not result.ok:
-                span.set_status("error")
+                set_error(span, result.content)
             return result
 
     def execute(self, arguments: dict[str, Any]) -> str:
@@ -166,8 +170,11 @@ class WriteFileTool(BaseTool):
         },
         "required": ["path", "content"],
     }
-    risk_level = "L1"
+    risk_level = "R1"
     idempotent = False
+
+    def risk_for(self, arguments: dict[str, Any]) -> str:
+        return "R2" if _is_protected_path(arguments.get("path", "")) else "R1"
 
     def execute(self, arguments: dict[str, Any]) -> str:
         path = self.resolve_workspace_path(arguments.get("path", ""))
@@ -216,8 +223,11 @@ class EditFileTool(BaseTool):
         },
         "required": ["path", "old_text", "new_text"],
     }
-    risk_level = "L1"
+    risk_level = "R1"
     idempotent = False
+
+    def risk_for(self, arguments: dict[str, Any]) -> str:
+        return "R2" if _is_protected_path(arguments.get("path", "")) else "R1"
 
     def execute(self, arguments: dict[str, Any]) -> str:
         path = self.resolve_workspace_path(arguments.get("path", ""))
@@ -338,3 +348,21 @@ def _append_text(content: str, new_text: str) -> str:
     if content.endswith("\n"):
         return content + new_text
     return content + "\n" + new_text
+
+
+def _is_protected_path(raw_path: Any) -> bool:
+    normalized = str(raw_path or "").replace("\\", "/").strip("/").lower()
+    if not normalized:
+        return False
+    name = normalized.rsplit("/", 1)[-1]
+    if name == ".env" or name.startswith(".env."):
+        return True
+    protected_prefixes = (
+        ".git/hooks/",
+        ".github/workflows/",
+        "skills/",
+        "prompts/",
+    )
+    if normalized.startswith(protected_prefixes):
+        return True
+    return name in {"config.py", "pyproject.toml", "dockerfile"}

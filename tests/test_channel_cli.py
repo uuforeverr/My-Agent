@@ -1,8 +1,8 @@
+from agent.run_context import TurnResult
 from channel.cli.cli_channel import CONTINUE, PRODUCED, STOP, CLIChannel
 from channel.conversation import CONVERSATION_ID_PATTERN
 from channel.message import IncomingMessage
 from channel.reply import Reply
-from observability import Trace
 
 
 class DreamAgent:
@@ -33,71 +33,9 @@ def test_dispatch_blank_continues(settings_factory, tmp_path):
     assert channel.sessions == {}
 
 
-def test_dispatch_trace_without_trace(settings_factory, tmp_path, capsys):
+def test_trace_command_is_no_longer_a_local_observability_backdoor(settings_factory, tmp_path):
     channel = _channel(settings_factory, tmp_path)
-    assert channel._dispatch("/trace") == CONTINUE
-    assert "No trace yet." in capsys.readouterr().out
-
-
-def test_dispatch_trace_prints_existing_trace(settings_factory, tmp_path, capsys):
-    channel = _channel(settings_factory, tmp_path)
-
-    class FakeTrace:
-        def to_json(self, pretty=False):
-            return '{"events": []}'
-
-    channel.last_trace = FakeTrace()
-    assert channel._dispatch("/trace") == CONTINUE
-    assert '"events"' in capsys.readouterr().out
-
-
-def test_dispatch_trace_by_id_prints_persisted_trace(settings_factory, tmp_path, capsys):
-    channel = _channel(settings_factory, tmp_path)
-    trace = Trace(request_id="persisted-1")
-    with trace.start_span("agent.invoke", span_kind="agent.invoke", session_id="cli:local"):
-        pass
-    channel.trace_store.append(trace)
-
-    assert channel._dispatch("/trace persisted-1") == CONTINUE
-
-    out = capsys.readouterr().out
-    assert "trace persisted-1" in out
-    assert "span tree" in out
-    assert "agent.invoke" in out
-    assert '"trace_id": "persisted-1"' in out
-
-
-def test_dispatch_trace_by_id_missing(settings_factory, tmp_path, capsys):
-    channel = _channel(settings_factory, tmp_path)
-
-    assert channel._dispatch("/trace missing") == CONTINUE
-
-    assert "Trace not found: missing" in capsys.readouterr().out
-
-
-def test_dispatch_traces_lists_persisted_traces(settings_factory, tmp_path, capsys):
-    channel = _channel(settings_factory, tmp_path)
-    success = Trace(request_id="success-1")
-    with success.start_span("agent.invoke", span_kind="agent.invoke"):
-        pass
-    error = Trace(request_id="error-1")
-    try:
-        with error.start_span("tool.execute", span_kind="tool.execute"):
-            raise RuntimeError("boom")
-    except RuntimeError:
-        pass
-    channel.trace_store.append(success)
-    channel.trace_store.append(error)
-
-    assert channel._dispatch("/traces 1") == CONTINUE
-    out = capsys.readouterr().out
-    assert "error-1" in out
-    assert "success-1" not in out
-
-    assert channel._dispatch("/traces 10 status=success") == CONTINUE
-    out = capsys.readouterr().out
-    assert "success-1" in out
-    assert "error-1" not in out
+    assert channel._dispatch("/trace") == PRODUCED
 
 
 def test_dispatch_dream_invokes_memory(settings_factory, tmp_path, capsys):
@@ -229,16 +167,35 @@ def test_send_prints_reply(settings_factory, tmp_path, capsys):
     assert "the answer" in capsys.readouterr().out
 
 
-def test_parse_traces_args_supports_filters():
-    query = CLIChannel._parse_traces_args(
-        "/traces 20 status=error session_id=cli:local entrypoint=cli "
-        "before=trace-1 start=2026-07-15T10:00:00 end=2026-07-15T11:00:00"
-    )
+def test_cli_streams_deltas_without_duplicating_final_answer(settings_factory, tmp_path, capsys):
+    class StreamingAgent:
+        def run(self, content, context=None, on_event=None):
+            on_event({"type": "assistant_delta", "content": "第一块"})
+            on_event({"type": "assistant_progress", "content": "正在调用工具"})
+            on_event({"type": "assistant_delta", "content": "第二块"})
+            return "第二块", TurnResult()
 
-    assert query.limit == 20
-    assert query.status == "error"
-    assert query.session_id == "cli:local"
-    assert query.entrypoint == "cli"
-    assert query.before == "trace-1"
-    assert query.start == "2026-07-15T10:00:00"
-    assert query.end == "2026-07-15T11:00:00"
+    channel = _channel(settings_factory, tmp_path, agent=StreamingAgent())
+    msg = IncomingMessage(channel_type="cli", user_id="local", content="q", msg_id="stream-1")
+
+    channel._handle(msg)
+
+    out = capsys.readouterr().out
+    assert "第一块" in out
+    assert "第二块" in out
+    assert out.count("第一块") == 1
+    assert out.count("第二块") == 1
+    assert "正在调用工具" not in out
+
+
+def test_cli_stream_falls_back_to_completed_text_without_deltas(settings_factory, tmp_path, capsys):
+    class CompletedOnlyAgent:
+        def run(self, content, context=None, on_event=None):
+            return "完整最终答案", TurnResult()
+
+    channel = _channel(settings_factory, tmp_path, agent=CompletedOnlyAgent())
+    msg = IncomingMessage(channel_type="cli", user_id="local", content="q", msg_id="stream-2")
+
+    channel._handle(msg)
+
+    assert capsys.readouterr().out.count("完整最终答案") == 1

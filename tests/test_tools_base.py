@@ -64,7 +64,7 @@ def test_schema_shape(tmp_workspace: Path):
 
 def test_default_risk_fields(tmp_workspace: Path):
     tool = _EchoTool(tmp_workspace)
-    assert tool.risk_level == "L0"
+    assert tool.risk_level == "R0"
     assert tool.requires_approval is None
     assert tool.idempotent is True
-    assert tool.risk_for({}) == "L0"
+    assert tool.risk_for({}) == "R0"

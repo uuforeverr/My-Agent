@@ -3,13 +3,12 @@ import threading
 from datetime import datetime
 from typing import Any, Callable
 
-from scheduler.schedule import calculate_next_run, parse_naive_local
+from scheduler.schedule import calculate_latest_due_and_next, calculate_next_run, parse_naive_local
 from scheduler.task_store import TaskStore
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCAN_INTERVAL = 30
-DEFAULT_CATCHUP_SECONDS = 600  # execute tasks up to 10 min late; skip if older
 WAITING_APPROVAL = "waiting_approval"
 
 # execute_callback(task) -> True delivered, False retry, "waiting_approval" parked
@@ -29,13 +28,11 @@ class SchedulerService:
         task_store: TaskStore,
         execute_callback: ExecuteCallback,
         scan_interval: int = DEFAULT_SCAN_INTERVAL,
-        catchup_seconds: int = DEFAULT_CATCHUP_SECONDS,
         approval_gate: Any = None,
     ):
         self.task_store = task_store
         self.execute_callback = execute_callback
         self.scan_interval = max(int(scan_interval), 1)
-        self.catchup_seconds = max(int(catchup_seconds), 0)
         self.approval_gate = approval_gate
         self._running = False
         self._thread = None
@@ -76,6 +73,13 @@ class SchedulerService:
             try:
                 if not self._is_due(task, now):
                     continue
+                latest_due, _next_future, _due_count = calculate_latest_due_and_next(
+                    task.get("schedule") or {},
+                    task["next_run_at"],
+                    now=now,
+                )
+                if latest_due is not None and latest_due.isoformat() != task["next_run_at"]:
+                    task = self.task_store.update(task["id"], {"next_run_at": latest_due.isoformat()})
                 outcome = self._execute(task)
                 if outcome is False:
                     # Delivery failed; keep next_run_at and retry next tick.
@@ -101,19 +105,7 @@ class SchedulerService:
         if next_run > now:
             return False
 
-        late_seconds = (now - next_run).total_seconds()
-        if late_seconds <= self.catchup_seconds:
-            return True
-
-        # Missed by more than the catch-up window (e.g. process was down).
-        schedule_type = (task.get("schedule") or {}).get("type")
-        if schedule_type == "once":
-            self.task_store.delete(task["id"])
-        else:
-            rescheduled = calculate_next_run(task.get("schedule") or {}, from_time=now)
-            if rescheduled is not None:
-                self.task_store.update(task["id"], {"next_run_at": rescheduled.isoformat()})
-        return False
+        return True
 
     def _execute(self, task: dict[str, Any]) -> Any:
         try:
@@ -170,13 +162,18 @@ class SchedulerService:
         self.task_store.set_enabled(task_id, False)
 
     def _advance(self, task: dict[str, Any], now: datetime, *, clear_error: bool = True) -> None:
-        next_run = calculate_next_run(task.get("schedule") or {}, from_time=now)
+        scheduled_for = task.get("next_run_at") or now
+        latest_due, next_run, _due_count = calculate_latest_due_and_next(
+            task.get("schedule") or {},
+            scheduled_for,
+            now=now,
+        )
         if next_run is None:
             self.task_store.delete(task["id"])
             return
         updates = {
             "next_run_at": next_run.isoformat(),
-            "last_run_at": now.isoformat(timespec="seconds"),
+            "last_run_at": (latest_due or parse_naive_local(scheduled_for)).isoformat(timespec="seconds"),
         }
         if clear_error:
             updates["last_error"] = None

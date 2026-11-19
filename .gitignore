@@ -3,3 +3,22 @@
 !.env.example
 .venv/
 .agent/
+__pycache__/
+*.py[cod]
+data/state.db*
+data/e2e/
+data/observability/phoenix/
+artifacts/effect-validation/
+.idea/
+.cursor/
+.codex-ppt-build/
+.codex-slide-review/
+ppt-output/
+
+# Local runtime memory and experiment outputs
+data/e2e-memory/
+data/memory/conversation_state.json
+data/memory/episodic_watermark.json
+data/memory/daily/
+data/memory/raw/
+data/memory/semantic/

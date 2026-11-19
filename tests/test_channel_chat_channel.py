@@ -1,6 +1,7 @@
-import json
 import threading
+import time
 
+from agent.run_context import TurnResult
 from channel.chat_channel import ChatChannel
 from channel.message import IncomingMessage
 from channel.reply import Reply
@@ -136,7 +137,7 @@ def test_handle_builds_run_context_and_sends(settings_factory, tmp_path):
 
         def run(self, content, context=None, on_event=None):
             self.seen_context = context
-            return f"answer:{content}", "trace-obj"
+            return f"answer:{content}", TurnResult()
 
     agent = CtxAgent()
     channel = RecordingChannel(agent=agent, settings=settings)
@@ -149,7 +150,6 @@ def test_handle_builds_run_context_and_sends(settings_factory, tmp_path):
     assert ctx.get("entrypoint") == "cli"
     assert ctx.get("user_id") == "a"
     assert channel.sent == [("cli:a", "answer:hello")]
-    assert channel.last_trace == "trace-obj"
 
 
 def test_handle_sends_assistant_progress_before_final(settings_factory, tmp_path):
@@ -161,7 +161,7 @@ def test_handle_sends_assistant_progress_before_final(settings_factory, tmp_path
                 "type": "assistant_progress",
                 "content": "让我翻翻关于你的记忆～",
             })
-            return "最终答案", "trace-obj"
+            return "最终答案", TurnResult()
 
     channel = RecordingChannel(agent=ProgressAgent(), settings=settings)
 
@@ -183,7 +183,7 @@ def test_handle_sends_approval_request_before_final(settings_factory, tmp_path):
                 "content": "待审批 [abcdef12]\n工具: bash    等级: L2",
                 "approval_id": "abcdef12",
             })
-            return "已执行", "trace-obj"
+            return "已执行", TurnResult()
 
     channel = RecordingChannel(agent=ApprovalProgressAgent(), settings=settings)
     channel._handle(_msg("a", content="run tests", channel_type="cli"))
@@ -194,27 +194,28 @@ def test_handle_sends_approval_request_before_final(settings_factory, tmp_path):
     ]
 
 
-def test_handle_persists_success_trace(settings_factory, tmp_path):
+def test_handle_exports_success_turn_to_native_otel(settings_factory, tmp_path, otel_exporter):
     settings = settings_factory(workspace=tmp_path / "w")
 
     class TraceAgent:
         def run(self, content, context=None, on_event=None):
-            context.trace.add("agent_done", content=content)
-            return "ok", context.trace
+            return "ok", TurnResult(outcome="success")
 
     channel = RecordingChannel(agent=TraceAgent(), settings=settings)
 
     channel._handle(_msg("a", content="hello", channel_type="cli"))
 
-    trace_path = tmp_path / "data" / "observability" / "traces.jsonl"
-    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
-    assert len(records) == 1
-    assert records[0]["status"] == "success"
-    assert records[0]["events"][0]["name"] == "agent_done"
-    assert records[0]["events"][0]["content"] == "hello"
+    spans = otel_exporter.get_finished_spans()
+    root = next(span for span in spans if span.name == "turn my-agent")
+    ingress = next(span for span in spans if span.name == "receive_request cli")
+    response = next(span for span in spans if span.name == "send_response cli")
+    assert ingress.parent.span_id == root.context.span_id
+    assert response.parent.span_id == root.context.span_id
+    assert root.attributes["my_agent.run.outcome"] == "success"
+    assert root.end_time >= response.end_time
 
 
-def test_handle_error_is_reported_and_semaphore_released(settings_factory, tmp_path):
+def test_handle_error_is_reported_and_semaphore_released(settings_factory, tmp_path, otel_exporter):
     settings = settings_factory(workspace=tmp_path / "w")
 
     class BoomAgent:
@@ -228,13 +229,13 @@ def test_handle_error_is_reported_and_semaphore_released(settings_factory, tmp_p
     assert channel.sent_event.wait(timeout=WAIT_TIMEOUT)
     assert channel.sent[0][0] == "cli:a"
     assert "boom" in channel.sent[0][1]
-    assert channel.last_trace.status == "error"
-
-    trace_path = tmp_path / "data" / "observability" / "traces.jsonl"
-    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
-    assert records[0]["status"] == "error"
-    assert records[0]["error"]["type"] == "RuntimeError"
-    assert records[0]["events"][0]["name"] == "channel_handle_error"
+    deadline = time.monotonic() + WAIT_TIMEOUT
+    roots = []
+    while not roots and time.monotonic() < deadline:
+        roots = [span for span in otel_exporter.get_finished_spans() if span.name == "turn my-agent"]
+        time.sleep(0.01)
+    assert roots[0].status.status_code.name == "ERROR"
+    assert roots[0].attributes["my_agent.run.outcome"] == "failed"
 
     # The semaphore for the session must have been released, so a follow-up
     # message on the same session is still processed (no deadlock).

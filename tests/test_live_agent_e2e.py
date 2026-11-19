@@ -1,4 +1,5 @@
 import os
+from dataclasses import replace
 
 import pytest
 
@@ -27,21 +28,21 @@ def test_live_deepseek_agent_reads_file_once(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    settings = type(base)(
+    settings = replace(
+        base,
         project_root=project_root,
-        openai_api_key=base.openai_api_key,
-        openai_api_base=base.openai_api_base,
-        model=base.model,
         workspace=workspace,
+        state_db_path=project_root / "data" / "state.db",
         max_steps=4,
-        max_history_messages=20,
+        session_window_turns=20,
         memory_search_results=2,
-        memory_flush_messages=4,
         bash_timeout=5,
+        scheduler_enabled=False,
+        otel_enabled=False,
     )
     agent = Agent(settings)
     try:
-        answer, trace = agent.run(
+        answer, result = agent.run(
             "请读取 a.txt，并用一句中文总结文件内容。",
             context=RunContext.create("live", workspace, entrypoint="test"),
         )
@@ -51,4 +52,4 @@ def test_live_deepseek_agent_reads_file_once(tmp_path, monkeypatch):
     assert answer.strip()
     raw_records = agent.memory.raw_store.read_day("live")
     assert any(record["role"] == "tool" for record in raw_records)
-    assert any(event["name"] == "tool_call" for event in trace.events)
+    assert result.outcome == "success"

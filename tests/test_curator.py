@@ -21,7 +21,23 @@ def test_summarize_daily_parses_bullets():
         session_id="s",
         reason="context_trim",
     )
-    assert items == ["事件一", "事件二"]
+    assert items == [
+        {"body": "事件一", "stable_facts": [], "lessons": []},
+        {"body": "事件二", "stable_facts": [], "lessons": []},
+    ]
+
+
+def test_parse_episodic_output_truncates_at_clause_boundary():
+    curator = MemoryCurator()
+    body = "第一句描述背景。第二句描述处理过程，并说明最终结果已经落盘，后面还有不应被机械截断的补充文字。"
+
+    items = curator.parse_episodic_output(
+        '[{"body":"' + body + '","stable_facts":[],"lessons":[]}]',
+        body_max_chars=40,
+    )
+
+    assert len(items[0]["body"]) <= 40
+    assert items[0]["body"].endswith(("。", "！", "？", "!", "?", "…"))
 
 
 def test_parse_bullets_filters_sentinel():

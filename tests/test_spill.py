@@ -32,7 +32,9 @@ class _FixedOutputTool(BaseTool):
 def registry(tmp_workspace, tmp_memory_dir):
     memory = MemoryManager(tmp_memory_dir, llm=None)
     try:
-        yield ToolRegistry(tmp_workspace, memory)
+        # Spill tests isolate output handling; approval behavior is covered by
+        # the policy and approval suites.
+        yield ToolRegistry(tmp_workspace, memory, approval_mode="never")
     finally:
         memory.close()
 

@@ -31,7 +31,7 @@ class _SpyTool(BaseTool):
 
 
 class _CapturePolicy(ToolPolicy):
-    def __init__(self, mode="off"):
+    def __init__(self, mode="never"):
         super().__init__(mode)
         self.requests = []
 
@@ -54,7 +54,7 @@ def store(tmp_path):
     return TaskStore(tmp_path / "scheduler" / "tasks.json")
 
 
-def _registry(tmp_workspace, memory, store, mode="off", policy=None):
+def _registry(tmp_workspace, memory, store, mode="never", policy=None):
     return ToolRegistry(
         tmp_workspace,
         memory,
@@ -68,79 +68,89 @@ def _request(**overrides):
     payload = {
         "name": "bash",
         "arguments": {"command": "python -c pass"},
-        "risk_level": "L2",
+        "risk_level": "R2",
     }
     payload.update(overrides)
     return ToolRequest(**payload)
 
 
-def test_normalize_approval_mode_only_on_is_enabled():
-    assert normalize_approval_mode("on") == "on"
-    assert normalize_approval_mode("ON") == "on"
-    assert normalize_approval_mode(" off ") == "off"
-    assert normalize_approval_mode("true") == "off"
-    assert normalize_approval_mode("1") == "off"
-    assert normalize_approval_mode("") == "off"
-    assert ToolPolicy("ON").mode == "on"
+def test_normalize_approval_mode_supports_new_modes_and_legacy_aliases():
+    assert normalize_approval_mode("always") == "always"
+    assert normalize_approval_mode("NEVER") == "never"
+    assert normalize_approval_mode("risk_based") == "risk_based"
+    assert normalize_approval_mode("on") == "always"
+    assert normalize_approval_mode(" off ") == "never"
+    assert normalize_approval_mode("true") == "invalid"
+    assert normalize_approval_mode("") == "invalid"
+    assert ToolPolicy("ALWAYS").mode == "always"
 
 
-def test_policy_off_allows_every_level():
-    policy = ToolPolicy("off")
-    for risk in ("L0", "L1", "L2", "L3", "L9"):
+def test_policy_never_allows_r0_to_r2_but_denies_unknown():
+    policy = ToolPolicy("never")
+    for risk in ("R0", "R1", "R2"):
         decision = policy.decide(_request(risk_level=risk))
         assert decision.action == "allow"
-        assert decision.reason == "approval_mode_off"
+        assert decision.reason == "approval_mode_never"
+    assert policy.decide(_request(risk_level="R3")).reason == "unknown_risk_level"
+    assert policy.decide(_request(risk_level="R9")).reason == "unknown_risk_level"
 
 
-def test_policy_on_levels_and_overrides():
-    policy = ToolPolicy("on")
-    assert policy.decide(_request(name="glob", risk_level="L0")).action == "allow"
-    assert policy.decide(_request(name="write_file", risk_level="L1")).action == "allow"
-    bash = policy.decide(_request())
-    assert bash.action == "need_approval"
-    assert bash.reason == "risk_requires_approval"
-    l3 = policy.decide(_request(name="future", risk_level="L3"))
-    assert l3.action == "need_approval"
-    web = policy.decide(_request(name="web_search", risk_level="L2", requires_approval=False))
-    assert web.action == "allow"
-    assert web.reason == "requires_approval_false"
-    forced = policy.decide(_request(name="glob", risk_level="L0", requires_approval=True))
-    assert forced.action == "need_approval"
+def test_policy_always_asks_for_every_permitted_model_tool():
+    policy = ToolPolicy("always")
+    for name, risk in (("glob", "R0"), ("write_file", "R1"), ("bash", "R2")):
+        decision = policy.decide(_request(name=name, risk_level=risk))
+        assert decision.action == "need_approval"
+        assert decision.reason == "approval_mode_always"
+    web = policy.decide(_request(name="web_search", risk_level="R1", requires_approval=False))
+    assert web.action == "need_approval"
+    assert policy.decide(_request(name="future", risk_level="R3")).action == "deny"
     unknown = policy.decide(_request(risk_level="LX"))
     assert unknown.action == "deny"
     assert unknown.reason == "unknown_risk_level"
 
 
+def test_policy_risk_based_allows_r0_r1_and_requires_approval_for_r2():
+    policy = ToolPolicy("risk_based")
+    for risk in ("R0", "R1"):
+        decision = policy.decide(_request(risk_level=risk))
+        assert decision.action == "allow"
+        assert decision.reason == "risk_based_low_risk"
+    r2 = policy.decide(_request(risk_level="R2"))
+    assert r2.action == "need_approval"
+    assert r2.reason == "risk_based_r2"
+    assert policy.decide(_request(risk_level="R3")).action == "deny"
+
+
 def test_static_risk_table():
-    assert GlobTool.risk_level == "L0"
-    assert ReadFileTool.risk_level == "L0"
-    assert SearchMemoryTool.risk_level == "L0"
-    assert ReadMemoryTool.risk_level == "L0"
-    assert WriteFileTool.risk_level == "L1"
-    assert EditFileTool.risk_level == "L1"
-    assert RememberMemoryTool.risk_level == "L1"
+    assert GlobTool.risk_level == "R0"
+    assert ReadFileTool.risk_level == "R0"
+    assert SearchMemoryTool.risk_level == "R0"
+    assert ReadMemoryTool.risk_level == "R0"
+    assert WriteFileTool.risk_level == "R1"
+    assert EditFileTool.risk_level == "R1"
+    assert RememberMemoryTool.risk_level == "R1"
     assert WriteFileTool.idempotent is False
-    assert BashTool.risk_level == "L2"
+    assert BashTool.risk_level == "R2"
     assert BashTool.idempotent is False
-    assert WebSearchTool.risk_level == "L2"
+    assert WebSearchTool.risk_level == "R1"
     assert WebSearchTool.requires_approval is False
-    assert SchedulerTool.risk_level == "L2"
+    assert SchedulerTool.risk_level == "R2"
 
 
 def test_scheduler_risk_for_by_action(tmp_workspace, tmp_path):
     tool = SchedulerTool(tmp_workspace, TaskStore(tmp_path / "tasks.json"))
-    assert tool.risk_for({"action": "list"}) == "L0"
-    assert tool.risk_for({"action": "get"}) == "L0"
-    assert tool.risk_for({"action": "create"}) == "L2"
-    assert tool.risk_for({"action": "delete"}) == "L2"
-    assert tool.risk_for({"action": "enable"}) == "L2"
-    assert tool.risk_for({"action": "disable"}) == "L2"
-    assert tool.risk_for({"action": "unknown"}) == "L2"
-    assert tool.risk_for({}) == "L2"
+    assert tool.risk_for({"action": "list"}) == "R0"
+    assert tool.risk_for({"action": "get"}) == "R0"
+    assert tool.risk_for({"action": "create"}) == "R2"
+    assert tool.risk_for({"action": "delete"}) == "R2"
+    assert tool.risk_for({"action": "enable"}) == "R2"
+    assert tool.risk_for({"action": "disable"}) == "R2"
+    assert tool.risk_for({"action": "unknown"}) == "R2"
+    assert tool.risk_for({}) == "R2"
 
 
 def test_off_mode_still_executes_l2(tmp_workspace, memory, store):
-    registry = _registry(tmp_workspace, memory, store, mode="off")
+    registry = _registry(tmp_workspace, memory, store, mode="never")
     spy = _SpyTool(tmp_workspace, "bash", "L2")
     registry.tools["bash"] = spy
 
@@ -151,7 +161,7 @@ def test_off_mode_still_executes_l2(tmp_workspace, memory, store):
 
 
 def test_on_mode_does_not_execute_l2_without_gate(tmp_workspace, memory, store):
-    registry = _registry(tmp_workspace, memory, store, mode="on")
+    registry = _registry(tmp_workspace, memory, store, mode="always")
     spy = _SpyTool(tmp_workspace, "bash", "L2")
     registry.tools["bash"] = spy
 
@@ -160,12 +170,12 @@ def test_on_mode_does_not_execute_l2_without_gate(tmp_workspace, memory, store):
     assert result.ok is False
     assert "requires approval" in result.content
     assert "bash" in result.content
-    assert "L2" in result.content
+    assert "R2" in result.content
     assert spy.calls == []
 
 
-def test_on_mode_allows_l0_l1_and_web_search(tmp_workspace, memory, store):
-    registry = _registry(tmp_workspace, memory, store, mode="on")
+def test_never_mode_allows_r0_r1_and_web_search(tmp_workspace, memory, store):
+    registry = _registry(tmp_workspace, memory, store, mode="never")
     web = _SpyTool(tmp_workspace, "web_search", "L2", requires_approval=False)
     registry.tools["web_search"] = web
 
@@ -180,8 +190,8 @@ def test_on_mode_allows_l0_l1_and_web_search(tmp_workspace, memory, store):
     assert web.calls == [{"query": "news"}]
 
 
-def test_on_mode_scheduler_list_is_l0_create_is_l2(tmp_workspace, memory, store):
-    registry = _registry(tmp_workspace, memory, store, mode="on")
+def test_never_mode_scheduler_list_and_create_execute(tmp_workspace, memory, store):
+    registry = _registry(tmp_workspace, memory, store, mode="never")
     context = RunContext.create(
         session_id="cli:local",
         workspace=tmp_workspace,
@@ -203,21 +213,51 @@ def test_on_mode_scheduler_list_is_l0_create_is_l2(tmp_workspace, memory, store)
 
     assert listed.ok is True
     assert json.loads(listed.content)["count"] == 0
-    assert created.ok is False
-    assert "requires approval" in created.content
-    assert store.list() == []
+    assert created.ok is True
+    assert len(store.list()) == 1
+
+
+def test_risk_based_registry_runs_r0_r1_but_stops_r2_without_gate(
+    tmp_workspace, memory, store
+):
+    registry = _registry(tmp_workspace, memory, store, mode="risk_based")
+    spy = _SpyTool(tmp_workspace, "bash", "R2")
+    registry.tools["bash"] = spy
+
+    assert registry.run("glob", {"pattern": "*"}).ok is True
+    assert registry.run("write_file", {"path": "r1.txt", "content": "ok"}).ok is True
+    denied = registry.run("bash", {"command": "python -c pass"})
+
+    assert denied.ok is False
+    assert denied.error_code == "approval_required"
+    assert spy.calls == []
+
+
+def test_risk_based_read_file_env_is_r0_but_bash_env_access_remains_denied(
+    tmp_workspace, memory, store
+):
+    (tmp_workspace / ".env").write_text("EXAMPLE=value\n", encoding="utf-8")
+    registry = _registry(tmp_workspace, memory, store, mode="risk_based")
+
+    read_result = registry.run("read_file", {"path": ".env"})
+    bash_result = registry.run("bash", {"command": "cat .env"})
+
+    assert read_result.ok is True
+    assert "EXAMPLE=value" in read_result.content
+    assert bash_result.ok is False
+    assert "credential" in bash_result.content.lower()
 
 
 @pytest.mark.parametrize("action", ["delete", "enable", "disable"])
 def test_on_mode_scheduler_mutating_actions_are_l2(tmp_workspace, memory, store, action):
-    registry = _registry(tmp_workspace, memory, store, mode="on")
+    registry = _registry(tmp_workspace, memory, store, mode="always")
     result = registry.run("scheduler", {"action": action, "task_id": "abcd1234"})
     assert result.ok is False
     assert "requires approval" in result.content
 
 
 def test_on_mode_unknown_risk_is_denied_without_running(tmp_workspace, memory, store):
-    registry = _registry(tmp_workspace, memory, store, mode="on")
+    registry = _registry(tmp_workspace, memory, store, mode="always")
     spy = _SpyTool(tmp_workspace, "weird", "LX")
     registry.tools["weird"] = spy
 
@@ -228,36 +268,37 @@ def test_on_mode_unknown_risk_is_denied_without_running(tmp_workspace, memory, s
     assert spy.calls == []
 
 
-def test_off_mode_does_not_emit_policy_span(tmp_workspace, memory, store):
-    registry = _registry(tmp_workspace, memory, store, mode="off")
+def test_never_mode_still_emits_policy_span(tmp_workspace, memory, store, otel_exporter):
+    registry = _registry(tmp_workspace, memory, store, mode="never")
     context = RunContext.create(session_id="cli:local", workspace=tmp_workspace)
 
     result = registry.run("write_file", {"path": "span.txt", "content": "x"}, context)
 
     assert result.ok is True
-    assert [span.span_kind for span in context.trace.spans] == ["tool.execute"]
+    assert {span.name for span in otel_exporter.get_finished_spans()} == {"execute_tool write_file", "tool.policy"}
 
 
-def test_on_mode_records_policy_span_under_execute(tmp_workspace, memory, store):
-    registry = _registry(tmp_workspace, memory, store, mode="on")
+def test_on_mode_records_policy_span_under_execute(tmp_workspace, memory, store, otel_exporter):
+    registry = _registry(tmp_workspace, memory, store, mode="always")
     registry.tools["bash"] = _SpyTool(tmp_workspace, "bash", "L2")
     context = RunContext.create(session_id="cli:local", workspace=tmp_workspace)
 
     result = registry.run("bash", {"command": "python -c pass"}, context)
 
     assert result.ok is False
-    kinds = [span.span_kind for span in context.trace.spans]
-    assert kinds == ["tool.execute", "tool.policy"]
-    execute_span, policy_span = context.trace.spans
-    assert policy_span.parent_span_id == execute_span.span_id
-    assert policy_span.attributes["decision"] == "need_approval"
-    assert policy_span.attributes["risk_level"] == "L2"
-    assert execute_span.attributes["error_type"] == "approval_required"
-    assert execute_span.status == "error"
+    spans = otel_exporter.get_finished_spans()
+    execute_span = next(span for span in spans if span.name == "execute_tool bash")
+    policy_span = next(span for span in spans if span.name == "tool.policy")
+    assert policy_span.parent.span_id == execute_span.context.span_id
+    assert policy_span.attributes["my_agent.policy.decision"] == "need_approval"
+    assert policy_span.attributes["my_agent.policy.mode"] == "always"
+    assert policy_span.attributes["my_agent.tool.risk_level"] == "R2"
+    assert execute_span.attributes["error.type"] == "approval_required"
+    assert execute_span.status.status_code.name == "ERROR"
 
 
 def test_on_mode_without_trace_still_denies_l2(tmp_workspace, memory, store):
-    registry = _registry(tmp_workspace, memory, store, mode="on")
+    registry = _registry(tmp_workspace, memory, store, mode="always")
     spy = _SpyTool(tmp_workspace, "bash", "L2")
     registry.tools["bash"] = spy
 
@@ -267,8 +308,8 @@ def test_on_mode_without_trace_still_denies_l2(tmp_workspace, memory, store):
     assert spy.calls == []
 
 
-def test_invalid_json_is_rejected_before_policy(tmp_workspace, memory, store):
-    policy = _CapturePolicy("on")
+def test_invalid_json_is_rejected_before_policy(tmp_workspace, memory, store, otel_exporter):
+    policy = _CapturePolicy("always")
     registry = _registry(tmp_workspace, memory, store, policy=policy)
     context = RunContext.create(session_id="cli:local", workspace=tmp_workspace)
 
@@ -277,12 +318,13 @@ def test_invalid_json_is_rejected_before_policy(tmp_workspace, memory, store):
     assert result.ok is False
     assert "Invalid JSON" in result.content
     assert policy.requests == []
-    assert [span.span_kind for span in context.trace.spans] == ["tool.execute"]
-    assert context.trace.spans[0].attributes["error_type"] == "invalid_json"
+    spans = otel_exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["execute_tool bash"]
+    assert spans[0].attributes["error.type"] == "invalid_json"
 
 
 def test_hidden_scheduler_is_rejected_before_policy(tmp_workspace, memory, store):
-    policy = _CapturePolicy("on")
+    policy = _CapturePolicy("always")
     registry = _registry(tmp_workspace, memory, store, policy=policy)
     context = RunContext.create(
         session_id="scheduler:cli:local:abcd1234",
@@ -298,7 +340,7 @@ def test_hidden_scheduler_is_rejected_before_policy(tmp_workspace, memory, store
 
 
 def test_scheduled_l2_is_denied_not_executed(tmp_workspace, memory, store):
-    registry = _registry(tmp_workspace, memory, store, mode="on")
+    registry = _registry(tmp_workspace, memory, store, mode="always")
     spy = _SpyTool(tmp_workspace, "bash", "L2")
     registry.tools["bash"] = spy
     context = RunContext.create(
@@ -315,7 +357,7 @@ def test_scheduled_l2_is_denied_not_executed(tmp_workspace, memory, store):
 
 
 def test_registry_builds_request_from_context(tmp_workspace, memory, store):
-    policy = _CapturePolicy("off")
+    policy = _CapturePolicy("never")
     registry = _registry(tmp_workspace, memory, store, policy=policy)
     context = RunContext.create(
         session_id="cli:alice",
@@ -331,7 +373,7 @@ def test_registry_builds_request_from_context(tmp_workspace, memory, store):
     assert result.ok is True
     request = policy.requests[0]
     assert request.name == "write_file"
-    assert request.risk_level == "L1"
+    assert request.risk_level == "R1"
     assert request.session_id == "cli:alice"
     assert request.channel_type == "cli"
     assert request.user_id == "alice"
@@ -347,10 +389,10 @@ def test_agent_passes_approval_mode_from_settings(settings_factory, tmp_path):
     settings = settings_factory(
         project_root=tmp_path,
         workspace=tmp_path / "workspace",
-        tool_approval_mode="on",
+        tool_approval_mode="always",
     )
     agent = Agent(settings)
     try:
-        assert agent.tools.policy.mode == "on"
+        assert agent.tools.policy.mode == "always"
     finally:
         agent.memory.close()

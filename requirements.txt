@@ -1,9 +1,26 @@
-# Runtime dependencies.
+# Runtime third-party packages. Install with:
+#   python -m pip install -r requirements.txt
 #
-# The core CLI uses only the Python standard library, but the documented
-# runtime feature set needs these optional integrations:
-# - lark-oapi: Feishu WebSocket channel
-# - croniter: cron-based scheduler tasks and daily dream scheduling
+# Test extras are in requirements-dev.txt (includes this file).
+
+# Direct dependencies (imported by the project)
 lark-oapi>=1.6,<2.0
 croniter>=6.0,<7.0
 tiktoken>=0.7,<1.0
+APScheduler>=3.11,<4.0
+openai>=3.0,<4.0
+jsonschema>=4.20,<5.0
+sentence-transformers>=3,<6
+sqlite-vec>=0.1,<1
+opentelemetry-api>=1.33,<2.0
+opentelemetry-sdk>=1.33,<2.0
+opentelemetry-exporter-otlp-proto-http>=1.33,<2.0
+
+# First-level runtime transitives
+python-dateutil>=2.8
+regex>=2022.1.18
+requests>=2.26.0
+requests-toolbelt>=0.9
+pycryptodome>=3.9
+websockets>=11,<16
+httpx>=0.24,<1.0

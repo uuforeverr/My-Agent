@@ -11,6 +11,29 @@ if str(PROJECT_ROOT) not in sys.path:
 from config import Settings
 
 
+@pytest.fixture
+def otel_exporter(tmp_path: Path):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    import observability.otel as otel
+
+    otel.shutdown_observability()
+    settings = type("OtelSettings", (), {
+        "project_root": tmp_path,
+        "otel_enabled": False,
+        "otel_capture_content": True,
+        "otel_content_max_bytes": 1_000_000,
+        "otel_service_name": "my-agent-test",
+        "otel_environment": "test",
+    })()
+    exporter = InMemorySpanExporter()
+    provider = otel.configure_observability(settings)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    yield exporter
+    provider.force_flush()
+    otel.shutdown_observability()
+
+
 class FakeLLM:
     """Offline stand-in for OpenAICompatibleClient.
 
@@ -61,6 +84,13 @@ def tmp_memory_dir(tmp_path: Path) -> Path:
 def settings_factory(tmp_path: Path):
     def _make(**overrides: Any) -> Settings:
         workspace = overrides.pop("workspace", tmp_path / "workspace")
+        if "keep_recent_turns" in overrides:
+            overrides["session_window_turns"] = overrides.pop("keep_recent_turns")
+        overrides.pop("max_history_messages", None)
+        overrides.pop("memory_flush_messages", None)
+        overrides.pop("episodic_scan_interval", None)
+        overrides.pop("episodic_flush_min_turns", None)
+        overrides.pop("daily_dream_lookback_days", None)
         Path(workspace).mkdir(parents=True, exist_ok=True)
         defaults: dict[str, Any] = {
             "project_root": tmp_path,
@@ -69,9 +99,9 @@ def settings_factory(tmp_path: Path):
             "model": "fake-model",
             "workspace": Path(workspace),
             "max_steps": 6,
-            "max_history_messages": 40,
+            "session_window_turns": 20,
             "memory_search_results": 5,
-            "memory_flush_messages": 12,
+            "memory_embedding_provider": "disabled",
             "bash_timeout": 20,
             "channels": ("cli",),
             "feishu_app_id": "",
@@ -81,16 +111,21 @@ def settings_factory(tmp_path: Path):
             "web_search_timeout": 15,
             "scheduler_enabled": True,
             "scheduler_scan_interval": 30,
-            "scheduler_catchup_seconds": 600,
+            "outbox_relay_interval_seconds": 15.0,
+            "outbox_relay_batch_size": 20,
+            "outbox_delivery_lease_seconds": 120.0,
             "scheduler_tasks_path": Path(workspace).parent / "data" / "scheduler" / "tasks.json",
             "daily_dream_enabled": True,
             "daily_dream_cron": "0 0 * * *",
-            "daily_dream_lookback_days": 1,
-            "tool_approval_mode": "off",
+            "tool_approval_mode": "risk_based",
             "model_context_window": None,
-            "keep_recent_turns": 3,
-            "episodic_scan_interval": 60,
-            "episodic_flush_min_turns": 20,
+            "raw_write_batch_size": 32,
+            "raw_write_flush_interval_ms": 10,
+            "raw_write_queue_capacity": 4096,
+            "episodic_batch_turns": 20,
+            "episodic_max_wait_seconds": 3600,
+            "episodic_worker_poll_seconds": 60,
+            "episodic_body_max_chars": 60,
         }
         defaults.update(overrides)
         return Settings(**defaults)

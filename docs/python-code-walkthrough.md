@@ -1,5 +1,9 @@
 # my-agent Python 代码逐行讲解
 
+> 历史说明：本文记录旧版实现路径。当前 Raw / Episodic / Semantic 设计以
+> `docs/memory-architecture.md` 与实际代码为准，本文中的 JSONL 扫描、同步压缩等
+> 记忆细节不再代表现状。
+
 这份文档按执行顺序阅读：
 
 ```text

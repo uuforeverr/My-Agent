@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import time
 from typing import Any, Optional
 
 
@@ -12,6 +13,7 @@ class IncomingMessage:
     group_id: Optional[str] = None
     conversation_id: Optional[str] = None
     raw: dict[str, Any] = field(default_factory=dict)
+    received_at_ns: int = field(default_factory=time.time_ns)
 
     @property
     def scope(self) -> str:

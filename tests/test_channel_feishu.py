@@ -2,6 +2,8 @@ import json
 import sys
 import time
 import types
+import urllib.error
+from io import BytesIO
 
 from channel.conversation import CONVERSATION_ID_PATTERN
 from channel.feishu.feishu_channel import FeishuChannel
@@ -361,6 +363,240 @@ def test_send_group_uses_chat_id(settings_factory, tmp_path, monkeypatch):
     assert captured["body"]["receive_id"] == "oc_g"
 
 
+def test_approval_event_sends_card_2_with_callback_buttons(settings_factory, tmp_path, monkeypatch):
+    channel = _channel(settings_factory, tmp_path)
+    monkeypatch.setattr(channel, "fetch_access_token", lambda: "tok")
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _Resp({"code": 0, "data": {"message_id": "om_approval"}})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    msg = IncomingMessage(channel_type="feishu", user_id="ou_x", content="q", msg_id="m1")
+    event = {
+        "type": "approval_request",
+        "content": "待审批 [abcdef12]",
+        "approval_id": "abcdef12",
+        "tool_name": "scheduler",
+        "risk_level": "L2",
+        "argument_lines": "  action: create\n  password: [redacted]",
+        "timeout_seconds": 120,
+        "session_scope_allowed": True,
+    }
+
+    receipt = channel._send_event(event, msg)
+
+    assert receipt.delivered is True
+    assert captured["body"]["msg_type"] == "interactive"
+    card = json.loads(captured["body"]["content"])
+    assert card["schema"] == "2.0"
+    assert card["header"]["template"] == "yellow"
+    buttons = [
+        column["elements"][0]
+        for element in card["body"]["elements"]
+        if element.get("tag") == "column_set"
+        for column in element.get("columns", [])
+        if column.get("elements") and column["elements"][0].get("tag") == "button"
+    ]
+    assert [button["text"]["content"] for button in buttons] == [
+        "仅本次允许",
+        "本会话允许",
+        "拒绝",
+    ]
+    assert buttons[0]["behaviors"][0]["value"] == {
+        "source": "my-agent-tool-approval",
+        "approval_id": "abcdef12",
+        "action": "approve",
+        "scope": "once",
+    }
+    assert "[redacted]" in json.dumps(card, ensure_ascii=False)
+
+
+def test_bash_approval_card_omits_session_wide_button(settings_factory, tmp_path):
+    channel = _channel(settings_factory, tmp_path)
+    event = channel._normalize_approval_event({
+        "approval_id": "abcdef12",
+        "tool_name": "bash",
+        "risk_level": "L2",
+        "argument_lines": "  command: pytest",
+        "session_scope_allowed": False,
+    })
+
+    card = channel._build_approval_card(event)
+    rendered = json.dumps(card, ensure_ascii=False)
+    assert "仅本次允许" in rendered
+    assert "本会话允许" not in rendered
+    assert "拒绝" in rendered
+
+
+def test_scheduled_approval_reply_is_upgraded_from_text_to_card(settings_factory, tmp_path, monkeypatch):
+    channel = _channel(settings_factory, tmp_path)
+    monkeypatch.setattr(channel, "fetch_access_token", lambda: "tok")
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _Resp({"code": 0, "data": {"message_id": "om_scheduled"}})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    msg = IncomingMessage(channel_type="feishu", user_id="ou_x", content="", msg_id="scheduled")
+    prompt = (
+        "待审批 [abcdef12]\n"
+        "工具: scheduler    等级: L2\n"
+        "参数:\n"
+        "  action: create\n\n"
+        "/approve abcdef12          仅本次\n"
+        "/approve abcdef12 session  本会话允许同类工具\n"
+        "/deny abcdef12             拒绝\n"
+        "超时 24h 将自动拒绝。"
+    )
+
+    receipt = channel.send(Reply(prompt, type="approval"), msg)
+
+    assert receipt.delivered is True
+    assert captured["body"]["msg_type"] == "interactive"
+    card = json.loads(captured["body"]["content"])
+    assert card["schema"] == "2.0"
+    assert "24h" in json.dumps(card, ensure_ascii=False)
+
+
+def test_approval_card_callback_resolves_gate_and_queues_card_update(settings_factory, tmp_path):
+    channel = _channel(settings_factory, tmp_path)
+
+    class ApprovalAgent:
+        def __init__(self):
+            self.calls = []
+
+        def approve_tool(self, approval_id, user_id, scope="once"):
+            self.calls.append((approval_id, user_id, scope))
+            return f"已批准 [{approval_id}]（本会话允许同类工具）"
+
+    agent = ApprovalAgent()
+    channel.agent = agent
+    channel._remember_approval_card("abcdef12", channel._normalize_approval_event({
+        "approval_id": "abcdef12",
+        "tool_name": "scheduler",
+        "risk_level": "L2",
+        "argument_lines": "  action: create",
+    }))
+    updates = []
+    channel._queue_approval_card_update = lambda message_id, card: updates.append((message_id, card))
+
+    response = channel._handle_card_action_event({
+        "operator": {"open_id": "ou_owner"},
+        "context": {"open_message_id": "om_approval"},
+        "action": {
+            "value": {
+                "source": "my-agent-tool-approval",
+                "approval_id": "abcdef12",
+                "action": "approve",
+                "scope": "session",
+            }
+        },
+    })
+
+    assert agent.calls == [("abcdef12", "ou_owner", "session")]
+    assert response["toast"]["type"] == "success"
+    assert updates[0][0] == "om_approval"
+    assert updates[0][1]["header"]["template"] == "green"
+    assert "behaviors" not in json.dumps(updates[0][1], ensure_ascii=False)
+    assert channel._get_approval_card("abcdef12") is None
+
+
+def test_approval_card_callback_keeps_card_on_authorization_failure(settings_factory, tmp_path):
+    channel = _channel(settings_factory, tmp_path)
+
+    class ApprovalAgent:
+        def approve_tool(self, approval_id, user_id, scope="once"):
+            return "无权审批该操作"
+
+    channel.agent = ApprovalAgent()
+    updates = []
+    channel._queue_approval_card_update = lambda message_id, card: updates.append((message_id, card))
+    response = channel._handle_card_action_event({
+        "operator": {"open_id": "ou_other"},
+        "context": {"open_message_id": "om_approval"},
+        "action": {
+            "value": {
+                "source": "my-agent-tool-approval",
+                "approval_id": "abcdef12",
+                "action": "approve",
+                "scope": "once",
+            }
+        },
+    })
+
+    assert response == {"toast": {"type": "error", "content": "无权审批该操作"}}
+    assert updates == []
+
+
+def test_update_interactive_approval_message(settings_factory, tmp_path, monkeypatch):
+    channel = _channel(settings_factory, tmp_path)
+    monkeypatch.setattr(channel, "fetch_access_token", lambda: "tok")
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["method"] = req.method
+        captured["url"] = req.full_url
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _Resp({"code": 0})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    card = {"schema": "2.0", "body": {"elements": []}}
+
+    receipt = channel._update_interactive_message("om_approval", card)
+
+    assert receipt.delivered is True
+    assert captured["method"] == "PUT"
+    assert captured["url"].endswith("/im/v1/messages/om_approval")
+    assert captured["body"]["msg_type"] == "interactive"
+    assert json.loads(captured["body"]["content"]) == card
+
+
+def test_stream_flush_updates_existing_feishu_message(settings_factory, tmp_path, monkeypatch):
+    channel = _channel(settings_factory, tmp_path)
+    monkeypatch.setattr(channel, "fetch_access_token", lambda: "tok")
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["method"] = req.method
+        captured["url"] = req.full_url
+        captured["headers"] = req.headers
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _Resp({"code": 0})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    msg = IncomingMessage(channel_type="feishu", user_id="ou_x", content="q", msg_id="m1")
+
+    receipt = channel._flush_stream_message(msg, "partial answer", "om_message_1")
+
+    assert receipt.delivered is True
+    assert receipt.provider_message_id == "om_message_1"
+    assert captured["method"] == "PUT"
+    assert captured["url"].endswith("/im/v1/messages/om_message_1")
+    assert captured["headers"]["Content-type"] == "application/json; charset=utf-8"
+    assert json.loads(captured["body"]["content"]) == {"text": "partial answer"}
+
+
+def test_stream_flush_preserves_feishu_http_error_body(settings_factory, tmp_path, monkeypatch):
+    channel = _channel(settings_factory, tmp_path)
+    monkeypatch.setattr(channel, "fetch_access_token", lambda: "tok")
+
+    def fake_urlopen(req, timeout):
+        payload = json.dumps({"code": 230001, "msg": "invalid request parameter"}).encode("utf-8")
+        raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", None, BytesIO(payload))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    msg = IncomingMessage(channel_type="feishu", user_id="ou_x", content="q", msg_id="m1")
+
+    receipt = channel._flush_stream_message(msg, "partial answer", "om_message_1")
+
+    assert receipt.delivered is False
+    assert receipt.retryable is False
+    assert receipt.error == "230001: invalid request parameter"
+
+
 def test_fetch_access_token_parses_token(settings_factory, tmp_path, monkeypatch):
     channel = _channel(settings_factory, tmp_path)
     monkeypatch.setattr(
@@ -410,6 +646,9 @@ def test_startup_supervisor_rebuilds_client_on_failure(settings_factory, tmp_pat
 
     class FakeBuilder:
         def register_p2_im_message_receive_v1(self, _fn):
+            return self
+
+        def register_p2_card_action_trigger(self, _fn):
             return self
 
         def build(self):

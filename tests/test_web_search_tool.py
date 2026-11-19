@@ -93,8 +93,27 @@ def test_web_search_count_out_of_range_falls_back_to_default(tmp_workspace, monk
 
     result = tool.run({"query": "x", "count": 999})
 
-    assert result.ok is True
+    assert result.ok is False
+    assert result.error_code == "search_no_results"
+    assert result.retryable is True
     assert captured["body"]["resource_type_filter"][0]["top_k"] == 5
+
+
+def test_web_search_retries_transient_network_errors(tmp_workspace, monkeypatch):
+    attempts = {"count": 0}
+
+    def flaky(req, timeout):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise urllib.error.URLError("temporary")
+        return FakeResponse({"references": [{"title": "ok", "url": "https://example.com"}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", flaky)
+    monkeypatch.setattr("tools.web_search_tool.time.sleep", lambda _seconds: None)
+    result = WebSearchTool(tmp_workspace, api_key="key").run({"query": "x"})
+
+    assert result.ok is True
+    assert attempts["count"] == 3
 
 
 def test_web_search_http_error_is_readable(tmp_workspace, monkeypatch):

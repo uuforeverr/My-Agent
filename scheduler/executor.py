@@ -1,8 +1,8 @@
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from channel.reply import Reply
 from channel.target import ChannelTarget
-from observability import JsonlTraceStore, Trace
 
 WAITING_APPROVAL = "waiting_approval"
 
@@ -21,6 +21,21 @@ RunScan = Callable[..., Any]
 BuildContext = Callable[..., Any]
 
 
+@dataclass
+class ExecutionResult:
+    status: str
+    content: str = ""
+    trace_id: str = ""
+    error: str = ""
+    pending_approval_id: str = ""
+    parked_session_id: str = ""
+
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status == "succeeded"
+
+
 class SchedulerExecutor:
     """Runs a due task's action and delivers the outcome to its channel target.
 
@@ -37,7 +52,7 @@ class SchedulerExecutor:
         run_dream: Optional[RunDream] = None,
         run_scan: Optional[RunScan] = None,
         build_context: Optional[BuildContext] = None,
-        trace_store: Optional[JsonlTraceStore] = None,
+        trace_store: Optional[Any] = None,
     ):
         self.send_reply = send_reply
         self.run_agent = run_agent
@@ -50,65 +65,125 @@ class SchedulerExecutor:
     def execute(self, task: dict[str, Any]):
         action = task.get("action") or {}
         action_type = action.get("type")
-        trace = Trace()
-        trace.add(
-            "scheduler_execute_start",
-            task_id=task.get("id"),
-            action_type=action_type,
+        if action_type == "memory_dream":
+            result = self._memory_dream(task, action, None)
+        elif action_type == "memory_scan_episodic":
+            result = self._memory_scan_episodic(task, action, None)
+        else:
+            target = ChannelTarget.from_dict(action.get("target") or {})
+            if not target.channel_type:
+                raise ValueError(f"task {task.get('id')} has no delivery target")
+
+            if action_type == "send_message":
+                result = self._send_message(action, target)
+            elif action_type == "agent_task":
+                result = self._agent_task(task, action, target, None)
+            elif action_type == "tool_call":
+                result = self._tool_call(task, action, target, None)
+            else:
+                raise ValueError(f"unknown action type: {action_type!r}")
+        return result
+
+    def run_to_result(
+        self,
+        task: dict[str, Any],
+        run_id: str = "",
+        *,
+        run_kind: str = "",
+        scheduled_for: str = "",
+        deliver_at: str = "",
+    ) -> ExecutionResult:
+        """Execute a scheduled action without delivering its output.
+
+        The coordinator persists and delivers the returned result separately so
+        long-running agent work cannot block the scheduling clock.
+        """
+        action = task.get("action") or {}
+        action_type = action.get("type")
+        run = {
+            "id": run_id,
+            "task_id": task.get("id"),
+            "run_kind": run_kind,
+            "scheduled_for": scheduled_for,
+            "deliver_at": deliver_at,
+        }
+        try:
+            if action_type == "send_message":
+                content = (action.get("content") or "").strip()
+                if not content:
+                    raise ValueError("send_message action has empty content")
+                result = ExecutionResult("succeeded", content=content)
+            elif action_type == "memory_dream":
+                self._memory_dream(task, action, None)
+                result = ExecutionResult("succeeded")
+            elif action_type == "memory_scan_episodic":
+                self._memory_scan_episodic(task, action, None)
+                result = ExecutionResult("succeeded")
+            elif action_type == "agent_task":
+                result = self._run_agent_to_result(task, action, None)
+            elif action_type == "tool_call":
+                result = self._run_tool_to_result(task, action, None)
+            else:
+                raise ValueError(f"unknown action type: {action_type!r}")
+            return result
+        except Exception as exc:
+            return ExecutionResult(
+                "failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _run_agent_to_result(
+        self,
+        task: dict[str, Any],
+        action: dict[str, Any],
+        trace: Any,
+    ) -> ExecutionResult:
+        if self.run_agent is None or self.build_context is None:
+            raise ValueError("agent_task requires run_agent and build_context")
+        ai_task = (action.get("ai_task") or "").strip()
+        if not ai_task:
+            raise ValueError("agent_task action has empty ai_task")
+        target = ChannelTarget.from_dict(action.get("target") or {})
+        context = self._scheduler_context(task, target, trace=trace)
+        answer, _agent_trace = self.run_agent(ai_task, context=context)
+        waiting = context.get("waiting_approval") if context is not None else None
+        if waiting:
+            return ExecutionResult(
+                WAITING_APPROVAL,
+                content=(waiting.get("prompt") or answer or "").strip(),
+                pending_approval_id=waiting.get("approval_id") or "",
+                parked_session_id=context.session_id,
+            )
+        return ExecutionResult("succeeded", content=(answer or "").strip())
+
+    def _run_tool_to_result(
+        self,
+        task: dict[str, Any],
+        action: dict[str, Any],
+        trace: Any,
+    ) -> ExecutionResult:
+        if self.run_tool is None or self.build_context is None:
+            raise ValueError("tool_call requires run_tool and build_context")
+        tool_name = (action.get("tool_name") or "").strip()
+        if not tool_name:
+            raise ValueError("tool_call action has empty tool_name")
+        target = ChannelTarget.from_dict(action.get("target") or {})
+        context = self._scheduler_context(task, target, trace=trace, resume_kind="tool_call")
+        tool_result = self.run_tool(tool_name, action.get("tool_arguments") or {}, context)
+        if getattr(tool_result, "waiting_approval", False):
+            return ExecutionResult(
+                WAITING_APPROVAL,
+                content=(getattr(tool_result, "content", "") or "").strip(),
+                pending_approval_id=getattr(tool_result, "approval_id", "") or "",
+                parked_session_id=context.session_id,
+            )
+        return ExecutionResult(
+            "succeeded" if bool(getattr(tool_result, "ok", True)) else "failed",
+            content=(getattr(tool_result, "content", str(tool_result)) or "").strip(),
+            error="" if bool(getattr(tool_result, "ok", True)) else (getattr(tool_result, "content", "") or ""),
         )
 
-        try:
-            with trace.start_span(
-                "scheduler.execute",
-                span_kind="scheduler.execute",
-                task_id=task.get("id"),
-                action_type=action_type,
-            ) as span:
-                if action_type == "memory_dream":
-                    result = self._memory_dream(task, action, trace)
-                elif action_type == "memory_scan_episodic":
-                    result = self._memory_scan_episodic(task, action, trace)
-                else:
-                    target = ChannelTarget.from_dict(action.get("target") or {})
-                    if not target.channel_type:
-                        raise ValueError(f"task {task.get('id')} has no delivery target")
-
-                    if action_type == "send_message":
-                        result = self._send_message(action, target)
-                    elif action_type == "agent_task":
-                        result = self._agent_task(task, action, target, trace)
-                    elif action_type == "tool_call":
-                        result = self._tool_call(task, action, target, trace)
-                    else:
-                        raise ValueError(f"unknown action type: {action_type!r}")
-
-                parked = result == WAITING_APPROVAL
-                delivered = result is not False
-                span.set_attribute("delivered", delivered)
-                span.set_attribute("parked", parked)
-                if result is False:
-                    span.set_status("retry")
-                trace.add(
-                    "scheduler_execute_completed",
-                    task_id=task.get("id"),
-                    action_type=action_type,
-                    delivered=delivered,
-                    parked=parked,
-                )
-                trace.finish("success" if delivered else "retry")
-                return result
-        except Exception as e:
-            trace.record_error(
-                e,
-                event_name="scheduler_execute_error",
-                task_id=task.get("id"),
-                action_type=action_type,
-            )
-            raise
-        finally:
-            self._persist_trace(trace)
-
-    def _memory_dream(self, task: dict[str, Any], action: dict[str, Any], trace: Trace) -> bool:
+    def _memory_dream(self, task: dict[str, Any], action: dict[str, Any], trace: Any) -> bool:
         if self.run_dream is None:
             raise ValueError("memory_dream requires run_dream")
 
@@ -120,15 +195,9 @@ class SchedulerExecutor:
             raise ValueError("memory_dream lookback_days must be > 0")
 
         result = self.run_dream(lookback_days=lookback_days)
-        trace.add(
-            "scheduler_memory_dream_completed",
-            task_id=task.get("id"),
-            lookback_days=lookback_days,
-            ok=bool((result or {}).get("ok")) if isinstance(result, dict) else True,
-        )
         return True
 
-    def _memory_scan_episodic(self, task: dict[str, Any], action: dict[str, Any], trace: Trace) -> bool:
+    def _memory_scan_episodic(self, task: dict[str, Any], action: dict[str, Any], trace: Any) -> bool:
         if self.run_scan is None:
             raise ValueError("memory_scan_episodic requires run_scan")
 
@@ -146,14 +215,6 @@ class SchedulerExecutor:
             keep_recent_turns=keep_recent_turns,
             min_flush_turns=min_flush_turns,
         )
-        trace.add(
-            "scheduler_memory_scan_completed",
-            task_id=task.get("id"),
-            keep_recent_turns=keep_recent_turns,
-            min_flush_turns=min_flush_turns,
-            ok=bool((result or {}).get("ok")) if isinstance(result, dict) else True,
-            skipped=bool((result or {}).get("skipped")) if isinstance(result, dict) else False,
-        )
         return True
 
     def _send_message(self, action: dict[str, Any], target: ChannelTarget) -> bool:
@@ -167,7 +228,7 @@ class SchedulerExecutor:
         task: dict[str, Any],
         action: dict[str, Any],
         target: ChannelTarget,
-        trace: Trace,
+        trace: Any,
     ) -> bool:
         if self.run_agent is None or self.build_context is None:
             raise ValueError("agent_task requires run_agent and build_context")
@@ -186,11 +247,6 @@ class SchedulerExecutor:
                 self._deliver(target, prompt)
             return WAITING_APPROVAL
         answer = (answer or "").strip()
-        trace.add(
-            "scheduler_agent_task_completed",
-            task_id=task.get("id"),
-            answer_chars=len(answer),
-        )
         if not answer:
             return True
         return self._deliver(target, answer)
@@ -200,7 +256,7 @@ class SchedulerExecutor:
         task: dict[str, Any],
         action: dict[str, Any],
         target: ChannelTarget,
-        trace: Trace,
+        trace: Any,
     ) -> bool:
         if self.run_tool is None:
             raise ValueError("tool_call requires run_tool")
@@ -218,22 +274,14 @@ class SchedulerExecutor:
                 self._deliver(target, content)
             return WAITING_APPROVAL
         content = getattr(result, "content", str(result))
-        trace.add(
-            "scheduler_tool_call_completed",
-            task_id=task.get("id"),
-            tool_name=tool_name,
-            ok=bool(getattr(result, "ok", True)),
-            result_chars=len(content or ""),
-        )
         if not (content or "").strip():
             return True
         return self._deliver(target, content)
 
-    def _scheduler_context(self, task: dict[str, Any], target: ChannelTarget, trace: Trace, **extra):
+    def _scheduler_context(self, task: dict[str, Any], target: ChannelTarget, trace: Any, **extra):
         session_id = f"scheduler:{target.session_id or target.user_id}:{task.get('id')}"
         return self.build_context(
             session_id=session_id,
-            trace=trace,
             entrypoint="scheduler",
             channel_type=target.channel_type,
             user_id=target.user_id,
@@ -246,11 +294,3 @@ class SchedulerExecutor:
 
     def _deliver(self, target: ChannelTarget, content: str) -> bool:
         return bool(self.send_reply(target, Reply(content)))
-
-    def _persist_trace(self, trace: Trace) -> None:
-        if self.trace_store is None:
-            return
-        try:
-            self.trace_store.append(trace)
-        except Exception:
-            pass

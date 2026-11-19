@@ -6,17 +6,19 @@ from typing import Optional
 from agent.agent import Agent
 from agent.run_context import RunContext
 from channel.base import Channel
+from channel.delivery import DeliveryReceipt
 from channel.factory import create_channel
 from channel.reply import Reply
 from channel.target import ChannelTarget
 from config import Settings
-from observability import JsonlTraceStore
 from scheduler.executor import SchedulerExecutor
+from scheduler.coordinator import APSchedulerCoordinator
+from scheduler.repository import SchedulerRepository
 from scheduler.schedule import calculate_next_run
 from scheduler.service import SchedulerService
 
 DAILY_DREAM_TASK_ID = "system_daily_dream"
-EPISODIC_SCAN_TASK_ID = "system_episodic_scan"
+LEGACY_EPISODIC_SCAN_TASK_ID = "system_episodic_scan"
 RESTART_APPROVAL_MESSAGE = "进程重启，待审批已失效"
 
 
@@ -26,7 +28,7 @@ class ChannelManager:
         self.agent = agent or Agent(settings)
         self.channels: list[Channel] = []
         self._channel_map: dict[str, Channel] = {}
-        self.scheduler_service: Optional[SchedulerService] = None
+        self.scheduler_service: Optional[APSchedulerCoordinator | SchedulerService] = None
         self._resume_pool: Optional[ThreadPoolExecutor] = None
 
     def build_channels(self) -> list[Channel]:
@@ -44,21 +46,29 @@ class ChannelManager:
         IncomingMessage from the target. Returns False when the target channel
         is not available so the scheduler can retry later.
         """
+        return bool(self.send_with_receipt(target, reply))
+
+    def send_with_receipt(self, target: ChannelTarget, reply: Reply) -> DeliveryReceipt:
         channel = self._channel_map.get(target.channel_type)
         if channel is None:
-            return False
+            return DeliveryReceipt.failed(f"channel unavailable: {target.channel_type}", retryable=True)
         try:
-            channel.send(reply, target.to_incoming_message())
-            return True
-        except Exception:
-            return False
+            receipt = channel.send(reply, target.to_incoming_message())
+            if isinstance(receipt, DeliveryReceipt):
+                return receipt
+            # Compatibility for custom channels still implementing the old
+            # ``send() -> None`` contract.
+            return DeliveryReceipt.success()
+        except Exception as exc:
+            return DeliveryReceipt.failed(f"{type(exc).__name__}: {exc}", retryable=True)
 
     def start_scheduler(self) -> None:
         store = getattr(self.agent, "scheduler_store", None)
         if store is None or self.scheduler_service is not None:
             return
+        if store.get(LEGACY_EPISODIC_SCAN_TASK_ID) is not None:
+            store.delete(LEGACY_EPISODIC_SCAN_TASK_ID)
         self._ensure_daily_dream_task(store)
-        self._ensure_episodic_scan_task(store)
         gate = getattr(getattr(self.agent, "tools", None), "approval_gate", None)
         if gate is not None:
             gate.on_scheduled_resolved = self._on_scheduled_resolved
@@ -69,17 +79,32 @@ class ChannelManager:
             run_agent=self.agent.run,
             run_tool=self.agent.tools.run,
             run_dream=self.agent.memory.deep_dream,
-            run_scan=getattr(self.agent.memory, "scan_raw_for_episodic", None),
+            run_scan=None,
             build_context=self._build_scheduler_context,
-            trace_store=JsonlTraceStore.for_project(self.settings.project_root),
+            trace_store=None,
         )
-        self.scheduler_service = SchedulerService(
-            store,
-            execute_callback=executor.execute,
-            scan_interval=self.settings.scheduler_scan_interval,
-            catchup_seconds=self.settings.scheduler_catchup_seconds,
-            approval_gate=gate,
-        )
+        if isinstance(store, SchedulerRepository):
+            self.scheduler_service = APSchedulerCoordinator(
+                store,
+                executor,
+                self.send_with_receipt,
+                timezone=self.settings.scheduler_timezone,
+                max_workers=self.settings.scheduler_max_workers,
+                outbox_relay_interval_seconds=self.settings.outbox_relay_interval_seconds,
+                outbox_relay_batch_size=self.settings.outbox_relay_batch_size,
+                outbox_delivery_lease_seconds=self.settings.outbox_delivery_lease_seconds,
+            )
+            scheduler_tool = getattr(getattr(self.agent, "tools", None), "tools", {}).get("scheduler")
+            if scheduler_tool is not None:
+                scheduler_tool.bind_control(self.scheduler_service)
+        else:
+            # Compatibility for callers that explicitly inject the legacy JSON
+            # store. Production Agent instances always expose SchedulerRepository.
+            self.scheduler_service = SchedulerService(
+                store,
+                executor.execute,
+                approval_gate=gate,
+            )
         self._sweep_stale_waiting_approvals(store)
         self.scheduler_service.start()
 
@@ -96,10 +121,7 @@ class ChannelManager:
         if next_run is None:
             return
 
-        action = {
-            "type": "memory_dream",
-            "lookback_days": self.settings.daily_dream_lookback_days,
-        }
+        action = {"type": "memory_dream"}
         existing = store.get(DAILY_DREAM_TASK_ID)
         if existing is not None:
             updates = {}
@@ -127,49 +149,6 @@ class ChannelManager:
         }
         store.add(task)
 
-    def _ensure_episodic_scan_task(self, store) -> None:
-        interval = int(self.settings.episodic_scan_interval)
-        if interval <= 0:
-            return
-
-        now = datetime.now()
-        schedule = {"type": "interval", "seconds": interval}
-        next_run = calculate_next_run(schedule, from_time=now)
-        if next_run is None:
-            return
-
-        action = {
-            "type": "memory_scan_episodic",
-            "keep_recent_turns": self.settings.keep_recent_turns,
-            "min_flush_turns": self.settings.episodic_flush_min_turns,
-        }
-        existing = store.get(EPISODIC_SCAN_TASK_ID)
-        if existing is not None:
-            updates = {}
-            if existing.get("schedule") != schedule:
-                updates["schedule"] = schedule
-                updates["next_run_at"] = next_run.isoformat()
-            if existing.get("action") != action:
-                updates["action"] = action
-            if updates:
-                store.update(EPISODIC_SCAN_TASK_ID, updates)
-            return
-
-        task = {
-            "id": EPISODIC_SCAN_TASK_ID,
-            "name": "情景记忆水位扫描",
-            "enabled": True,
-            "created_at": now.isoformat(timespec="seconds"),
-            "updated_at": now.isoformat(timespec="seconds"),
-            "schedule": schedule,
-            "action": action,
-            "next_run_at": next_run.isoformat(),
-            "last_run_at": None,
-            "last_error": None,
-            "last_error_at": None,
-        }
-        store.add(task)
-
     def _on_scheduled_resolved(self, pending, outcome: str) -> None:
         approval_id = getattr(pending, "approval_id", "")
         if self._resume_pool is None:
@@ -181,12 +160,11 @@ class ChannelManager:
         resume = getattr(self.agent, "resume_after_approval", None)
         answer = ""
         parked_again = False
-        trace = None
+        turn_result = None
         try:
             if callable(resume):
-                answer, trace = resume(approval_id)
-                events = getattr(trace, "events", None) or []
-                parked_again = any(event.get("name") == "waiting_approval" for event in events)
+                answer, turn_result = resume(approval_id)
+                parked_again = getattr(turn_result, "outcome", "") == "waiting_approval"
         except Exception:
             answer = ""
         gate = getattr(getattr(self.agent, "tools", None), "approval_gate", None)
@@ -203,12 +181,7 @@ class ChannelManager:
             self.send_to(target, Reply(answer))
         if parked_again:
             task_id = pending.request.task_id if pending is not None else ""
-            new_id = ""
-            if trace is not None:
-                for event in reversed(trace.events or []):
-                    if event.get("name") == "waiting_approval":
-                        new_id = str(event.get("approval_id") or "")
-                        break
+            new_id = str(getattr(turn_result, "waiting_approval_id", "") or "")
             if task_id and self.agent.scheduler_store is not None:
                 self.agent.scheduler_store.update(
                     task_id,

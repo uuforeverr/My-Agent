@@ -3,59 +3,101 @@ from pathlib import Path
 from memory.raw_store import RawConversationStore
 
 
-def test_append_and_read(tmp_memory_dir: Path):
-    store = RawConversationStore(tmp_memory_dir)
-    store.append_message("default", "user", "hi")
-    store.append_message("default", "assistant", "hello", metadata={"k": 1})
-    records = store.read_day("default")
-    assert len(records) == 2
-    assert records[0]["role"] == "user"
-    assert records[0]["content"] == "hi"
-    assert records[1]["metadata"] == {"k": 1}
-    assert records[0]["created_at"]
+def _turn(store: RawConversationStore, session: str, index: int) -> int:
+    receipt = store.append_message(session, "user", f"u{index}")
+    store.append_message(
+        session,
+        "assistant",
+        f"a{index}",
+        turn_seq=receipt.turn_seq,
+    )
+    return receipt.turn_seq
 
 
-def test_read_missing_returns_empty(tmp_memory_dir: Path):
-    store = RawConversationStore(tmp_memory_dir)
-    assert store.read_day("nobody") == []
+def test_async_append_and_read_complete_turn(tmp_memory_dir: Path):
+    store = RawConversationStore(tmp_memory_dir, flush_interval_ms=5)
+    seq = _turn(store, "default", 1)
+
+    turns = store.read_recent_turns("default", 20)
+
+    assert [turn["turn_seq"] for turn in turns] == [seq]
+    assert [item["content"] for item in turns[0]["messages"]] == ["u1", "a1"]
+    store.close()
 
 
-def test_read_skips_bad_line(tmp_memory_dir: Path):
-    store = RawConversationStore(tmp_memory_dir)
-    path = store.append_message("s1", "user", "ok")
-    with path.open("a", encoding="utf-8") as f:
-        f.write("not-json\n")
-    records = store.read_day("s1")
-    assert len(records) == 1
+def test_incomplete_turn_is_not_hydrated(tmp_memory_dir: Path):
+    store = RawConversationStore(tmp_memory_dir, flush_interval_ms=5)
+    store.append_message("s1", "user", "unfinished")
+
+    assert store.read_recent_turns("s1", 20) == []
+    store.close()
 
 
-def test_safe_session_id_sanitizes(tmp_memory_dir: Path):
-    store = RawConversationStore(tmp_memory_dir)
-    store.append_message("a/b c", "user", "x")
-    dirs = [p.name for p in (tmp_memory_dir / "raw").iterdir()]
-    assert "a_b_c" in dirs
+def test_recent_n_turns_are_returned_in_chronological_order(tmp_memory_dir: Path):
+    store = RawConversationStore(tmp_memory_dir, flush_interval_ms=5)
+    for index in range(5):
+        _turn(store, "s1", index)
+
+    turns = store.read_recent_turns("s1", 3)
+
+    assert [turn["turn_seq"] for turn in turns] == [3, 4, 5]
+    assert [turn["messages"][0]["content"] for turn in turns] == ["u2", "u3", "u4"]
+    store.close()
 
 
-def test_path_is_session_and_day_scoped(tmp_memory_dir: Path):
-    store = RawConversationStore(tmp_memory_dir)
-    path = store.append_message("default", "user", "x")
-    assert path.parent.name == "default"
-    assert path.suffix == ".jsonl"
+def test_turn_keeps_assistant_tool_and_final_message(tmp_memory_dir: Path):
+    store = RawConversationStore(tmp_memory_dir, flush_interval_ms=5)
+    receipt = store.append_message("s1", "user", "read")
+    store.append_message(
+        "s1",
+        "assistant",
+        "",
+        metadata={"tool_calls": [{"id": "c1"}]},
+        turn_seq=receipt.turn_seq,
+    )
+    store.append_message("s1", "tool", "result", turn_seq=receipt.turn_seq)
+    store.append_message("s1", "assistant", "done", turn_seq=receipt.turn_seq)
+
+    records = store.read_session("s1")
+
+    assert [item["role"] for item in records] == ["user", "assistant", "tool", "assistant"]
+    assert [item["message_seq"] for item in records] == [1, 2, 3, 4]
+    store.close()
 
 
-def test_read_session_concatenates_days(tmp_memory_dir: Path):
-    store = RawConversationStore(tmp_memory_dir)
+def test_pending_recovery_includes_compacted_range_even_inside_recent_window(
+    tmp_memory_dir: Path,
+):
+    store = RawConversationStore(tmp_memory_dir, flush_interval_ms=5)
+    for index in range(5):
+        _turn(store, "s1", index)
+
+    turns = store.read_pending_turns(
+        "s1",
+        after_turn_seq=0,
+        exclude_recent=20,
+        through_turn_seq=4,
+    )
+
+    assert [turn["turn_seq"] for turn in turns] == [1, 2, 3, 4]
+    store.close()
+
+
+def test_legacy_jsonl_is_imported_once_without_deletion(tmp_memory_dir: Path):
     session_dir = tmp_memory_dir / "raw" / "cli_local_cid"
     session_dir.mkdir(parents=True, exist_ok=True)
-    (session_dir / "2026-07-05.jsonl").write_text(
-        '{"created_at":"2026-07-05T10:00:00","session_id":"cli:local:cid","role":"user","content":"day1"}\n',
+    path = session_dir / "2026-07-05.jsonl"
+    path.write_text(
+        '{"created_at":"2026-07-05T10:00:00","session_id":"cli:local:cid","role":"user","content":"day1"}\n'
+        '{"created_at":"2026-07-05T10:00:01","session_id":"cli:local:cid","role":"assistant","content":"day1 answer"}\n',
         encoding="utf-8",
     )
-    (session_dir / "2026-07-06.jsonl").write_text(
-        '{"created_at":"2026-07-06T10:00:00","session_id":"cli:local:cid","role":"assistant","content":"day2"}\n',
-        encoding="utf-8",
-    )
-    records = store.read_session("cli:local:cid")
-    assert [item["content"] for item in records] == ["day1", "day2"]
-    grouped = store.read_all_sessions()
-    assert [item["content"] for item in grouped["cli:local:cid"]] == ["day1", "day2"]
+
+    store = RawConversationStore(tmp_memory_dir)
+
+    assert [item["content"] for item in store.read_session("cli:local:cid")] == [
+        "day1",
+        "day1 answer",
+    ]
+    assert path.exists()
+    store.close()

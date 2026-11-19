@@ -45,6 +45,10 @@ def test_create_send_message_snapshots_target(tmp_path):
     assert task["action"]["target"]["channel_type"] == "cli"
     assert task["action"]["target"]["user_id"] == "local"
     assert task["schedule"] == {"type": "once", "run_at": task["schedule"]["run_at"]}
+    assert result.metadata["my_agent.operation"] == "scheduler.create"
+    assert result.metadata["my_agent.task.id"] == payload["task_id"]
+    assert result.metadata["my_agent.task.timing_semantics"] == "notify_at"
+    assert result.metadata["my_agent.origin.session_id"] == "cli:local"
     # +10m should be ~10 minutes out
     run_at = datetime.fromisoformat(task["next_run_at"])
     assert (run_at - datetime.now()).total_seconds() > 500

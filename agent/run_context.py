@@ -2,14 +2,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from observability import Trace
-
-
 @dataclass
 class RunContext:
     session_id: str
     workspace: Path
-    trace: Trace = field(default_factory=Trace)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -17,13 +13,11 @@ class RunContext:
         cls,
         session_id: str,
         workspace: Path,
-        trace: Optional[Trace] = None,
         **metadata: Any,
     ) -> "RunContext":
         return cls(
             session_id=session_id,
             workspace=workspace.resolve(),
-            trace=trace or Trace(),
             metadata=dict(metadata),
         )
 
@@ -32,3 +26,11 @@ class RunContext:
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.metadata.get(key, default)
+
+
+@dataclass
+class TurnResult:
+    outcome: str = "success"
+    trace_id: str = ""
+    recovered_error_count: int = 0
+    waiting_approval_id: str = ""

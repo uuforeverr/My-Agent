@@ -1,4 +1,6 @@
-# my-agent 记忆系统重构方案
+# my-agent 记忆系统重构方案（历史版本）
+
+> 本文记录旧的 JSONL + daily Markdown 方案，已停止作为实现依据。当前实现与配置以 `docs/memory-architecture.md` 和 `memory/README.md` 为准。
 
 ## 背景
 

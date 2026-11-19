@@ -83,6 +83,64 @@ def calculate_next_run(
     return None
 
 
+def calculate_latest_due_and_next(
+    schedule: dict[str, Any],
+    persisted_next_run: Any,
+    *,
+    now: Optional[datetime] = None,
+    count_cap: int = 1000,
+) -> tuple[Optional[datetime], Optional[datetime], int]:
+    """Collapse all due occurrences into the latest one.
+
+    Returns ``(latest_due, next_future, missed_count)``.  ``latest_due`` is
+    None when the persisted occurrence is still in the future.  The count is
+    capped because it is diagnostic only and must never cause an unbounded
+    catch-up loop.
+    """
+    now = now or datetime.now()
+    persisted = parse_naive_local(persisted_next_run)
+    if persisted > now:
+        return None, persisted, 0
+
+    schedule_type = (schedule or {}).get("type")
+    if schedule_type == "once":
+        return persisted, None, 1
+
+    if schedule_type == "interval":
+        seconds = int((schedule or {}).get("seconds") or 0)
+        if seconds <= 0:
+            return persisted, None, 1
+        elapsed = max(0.0, (now - persisted).total_seconds())
+        skipped = int(elapsed // seconds)
+        latest = persisted + timedelta(seconds=skipped * seconds)
+        return latest, latest + timedelta(seconds=seconds), min(skipped + 1, max(1, int(count_cap)))
+
+    if schedule_type == "cron":
+        expression = (schedule or {}).get("expression")
+        if not expression:
+            return persisted, None, 1
+        croniter = _load_croniter()
+        # Adding one microsecond makes an occurrence exactly at ``now`` count
+        # as due; croniter.get_prev() is otherwise strictly-before.
+        latest = croniter(expression, now + timedelta(microseconds=1)).get_prev(datetime)
+        if latest < persisted:
+            latest = persisted
+        next_future = croniter(expression, now).get_next(datetime)
+
+        cap = max(1, int(count_cap))
+        count = 1
+        cursor = persisted
+        while count < cap and cursor < latest:
+            candidate = croniter(expression, cursor).get_next(datetime)
+            if candidate > latest:
+                break
+            count += 1
+            cursor = candidate
+        return latest, next_future, count
+
+    return persisted, None, 1
+
+
 def _parse_once(value: str) -> datetime:
     match = RELATIVE_ONCE_PATTERN.match(value)
     if match:

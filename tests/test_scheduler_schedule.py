@@ -4,6 +4,7 @@ import pytest
 
 from scheduler.schedule import (
     ScheduleError,
+    calculate_latest_due_and_next,
     calculate_next_run,
     parse_naive_local,
     parse_schedule,
@@ -106,3 +107,56 @@ def test_cron_invalid_expression_raises():
     pytest.importorskip("croniter")
     with pytest.raises(ScheduleError):
         parse_schedule("cron", "not a cron")
+
+
+def test_latest_once_executes_stale_occurrence_once():
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    due = now - timedelta(days=1)
+    latest, next_future, count = calculate_latest_due_and_next(
+        {"type": "once", "run_at": due.isoformat()},
+        due,
+        now=now,
+    )
+    assert latest == due
+    assert next_future is None
+    assert count == 1
+
+
+def test_latest_interval_collapses_five_due_occurrences():
+    persisted = datetime(2026, 1, 1, 8, 0, 0)
+    now = datetime(2026, 1, 1, 12, 20, 0)
+    latest, next_future, count = calculate_latest_due_and_next(
+        {"type": "interval", "seconds": 3600},
+        persisted,
+        now=now,
+    )
+    assert latest == datetime(2026, 1, 1, 12, 0, 0)
+    assert next_future == datetime(2026, 1, 1, 13, 0, 0)
+    assert count == 5
+
+
+def test_latest_future_occurrence_is_not_due():
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    future = now + timedelta(minutes=5)
+    latest, next_future, count = calculate_latest_due_and_next(
+        {"type": "interval", "seconds": 300},
+        future,
+        now=now,
+    )
+    assert latest is None
+    assert next_future == future
+    assert count == 0
+
+
+def test_latest_cron_collapses_to_most_recent_occurrence():
+    pytest.importorskip("croniter")
+    persisted = datetime(2026, 1, 1, 8, 0, 0)
+    now = datetime(2026, 1, 1, 12, 20, 0)
+    latest, next_future, count = calculate_latest_due_and_next(
+        {"type": "cron", "expression": "0 * * * *"},
+        persisted,
+        now=now,
+    )
+    assert latest == datetime(2026, 1, 1, 12, 0, 0)
+    assert next_future == datetime(2026, 1, 1, 13, 0, 0)
+    assert count == 5

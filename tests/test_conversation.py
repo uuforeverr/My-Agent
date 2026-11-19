@@ -60,6 +60,8 @@ def test_conversation_id_survives_channel_reload(settings_factory, tmp_path):
     cid = first.current_conversation("local")
     reloaded = CLIChannel(agent=object(), settings=settings)
     assert reloaded.current_conversation("local") == cid
+    assert (tmp_path / "data" / "state.db").exists()
+    assert not (tmp_path / "data" / "memory" / "conversation_state.json").exists()
 
 
 def test_feishu_new_does_not_produce(settings_factory, tmp_path):

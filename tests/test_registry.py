@@ -55,7 +55,26 @@ def test_registry_rejects_invalid_json(tmp_workspace, tmp_memory_dir):
         memory.close()
 
 
-def test_registry_records_tool_span_for_success(tmp_workspace, tmp_memory_dir):
+def test_registry_returns_actionable_memory_schema_error(tmp_workspace, tmp_memory_dir):
+    memory = MemoryManager(tmp_memory_dir, llm=None)
+    try:
+        registry = ToolRegistry(tmp_workspace, memory)
+        invalid = registry.run(
+            "remember_memory",
+            {"operation": "UPDATE", "content": "修正后的事实"},
+        )
+
+        assert not invalid.ok
+        assert invalid.error_code == "invalid_arguments"
+        assert invalid.retryable is True
+        assert invalid.details["schema_errors"]
+        assert "memory_id" in invalid.content
+        assert "corrected arguments" in invalid.suggested_action
+    finally:
+        memory.close()
+
+
+def test_registry_records_tool_span_for_success(tmp_workspace, tmp_memory_dir, otel_exporter):
     memory = MemoryManager(tmp_memory_dir, llm=None)
     try:
         registry = ToolRegistry(tmp_workspace, memory)
@@ -64,17 +83,16 @@ def test_registry_records_tool_span_for_success(tmp_workspace, tmp_memory_dir):
         result = registry.run("write_file", '{"path":"span.txt","content":"hello"}', context)
 
         assert result.ok
-        span = context.trace.spans[0]
-        assert span.span_kind == "tool.execute"
-        assert span.attributes["tool_name"] == "write_file"
-        assert span.attributes["argument_keys"] == ["content", "path"]
-        assert span.attributes["ok"] is True
-        assert span.status == "success"
+        spans = otel_exporter.get_finished_spans()
+        span = next(span for span in spans if span.name == "execute_tool write_file")
+        assert span.attributes["gen_ai.tool.name"] == "write_file"
+        assert list(span.attributes["my_agent.tool.argument_keys"]) == ["content", "path"]
+        assert span.attributes["my_agent.tool.ok"] is True
     finally:
         memory.close()
 
 
-def test_registry_records_skill_activate_when_reading_skill_file(tmp_workspace, tmp_memory_dir):
+def test_registry_records_skill_activate_when_reading_skill_file(tmp_workspace, tmp_memory_dir, otel_exporter):
     skill_dir = tmp_workspace / "skills" / "code-review"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("# Code Review\n", encoding="utf-8")
@@ -86,20 +104,19 @@ def test_registry_records_skill_activate_when_reading_skill_file(tmp_workspace, 
         result = registry.run("read_file", {"path": "skills/code-review/SKILL.md"}, context)
 
         assert result.ok
-        tool_span, activate_span = context.trace.spans
-        assert tool_span.span_kind == "tool.execute"
-        assert activate_span.span_kind == "skill.activate"
-        assert activate_span.parent_span_id == tool_span.span_id
-        assert activate_span.attributes["skill_name"] == "code-review"
-        assert Path(activate_span.attributes["file_path"]).as_posix() == "skills/code-review/SKILL.md"
-        assert activate_span.attributes["activation_source"] == "read_file"
-        assert activate_span.attributes["ok"] is True
-        assert activate_span.status == "success"
+        spans = otel_exporter.get_finished_spans()
+        tool_span = next(span for span in spans if span.name == "execute_tool read_file")
+        activate_span = next(span for span in spans if span.name == "skill.activate")
+        assert activate_span.parent.span_id == tool_span.context.span_id
+        assert activate_span.attributes["my_agent.skill.name"] == "code-review"
+        assert Path(activate_span.attributes["my_agent.file.path"]).as_posix() == "skills/code-review/SKILL.md"
+        assert activate_span.attributes["my_agent.skill.activation_source"] == "read_file"
+        assert activate_span.attributes["my_agent.tool.ok"] is True
     finally:
         memory.close()
 
 
-def test_registry_does_not_record_skill_activate_for_normal_read(tmp_workspace, tmp_memory_dir):
+def test_registry_does_not_record_skill_activate_for_normal_read(tmp_workspace, tmp_memory_dir, otel_exporter):
     (tmp_workspace / "notes.md").write_text("# Notes\n", encoding="utf-8")
     memory = MemoryManager(tmp_memory_dir, llm=None)
     try:
@@ -109,12 +126,12 @@ def test_registry_does_not_record_skill_activate_for_normal_read(tmp_workspace, 
         result = registry.run("read_file", {"path": "notes.md"}, context)
 
         assert result.ok
-        assert [span.span_kind for span in context.trace.spans] == ["tool.execute"]
+        assert "skill.activate" not in [span.name for span in otel_exporter.get_finished_spans()]
     finally:
         memory.close()
 
 
-def test_registry_records_tool_span_for_invalid_json(tmp_workspace, tmp_memory_dir):
+def test_registry_records_tool_span_for_invalid_json(tmp_workspace, tmp_memory_dir, otel_exporter):
     memory = MemoryManager(tmp_memory_dir, llm=None)
     try:
         registry = ToolRegistry(tmp_workspace, memory)
@@ -123,11 +140,10 @@ def test_registry_records_tool_span_for_invalid_json(tmp_workspace, tmp_memory_d
         result = registry.run("read_file", "{bad-json", context)
 
         assert result.ok is False
-        span = context.trace.spans[0]
-        assert span.span_kind == "tool.execute"
-        assert span.status == "error"
-        assert span.attributes["tool_name"] == "read_file"
-        assert span.attributes["error_type"] == "invalid_json"
+        span = next(span for span in otel_exporter.get_finished_spans() if span.name == "execute_tool read_file")
+        assert span.status.status_code.name == "ERROR"
+        assert span.attributes["gen_ai.tool.name"] == "read_file"
+        assert span.attributes["error.type"] == "invalid_json"
     finally:
         memory.close()
 
